@@ -1,13 +1,11 @@
 //! Dense Gaussian elimination with partial pivoting.
 //!
-//! Used as a fallback by the Newton solver when the sparse LU detects a
-//! singular pivot.  Same algorithm as `src/lib/sim/linear.ts` — partial
-//! pivoting, in-place factorisation, forward + backward substitution.
+//! This module provides a robust dense linear solver used as a fallback
+//! when the primary sparse LU solver fails (e.g., due to numerical singularity).
+//! It implements standard Gaussian elimination with partial row pivoting.
 //!
-//! Performance is intentionally not optimised: this path runs only when
-//! the sparse LU has failed, which should never happen on a well-formed
-//! MNA matrix with gmin regularisation.  The point is correctness as a
-//! safety net, not speed.
+//! Note: This is a safety-net solver. Performance is prioritized for the
+//! `sparse` module, while this module focuses on correctness and robustness.
 
 /// Solve `A x = b` for `x`, returning `Some(x)` on success or `None` if
 /// the matrix is numerically singular (pivot below threshold even after

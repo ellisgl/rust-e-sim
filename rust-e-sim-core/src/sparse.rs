@@ -1,20 +1,25 @@
-//! Sparse LU factorization for MNA matrices.
+//! Sparse LU factorization for MNA (Modified Nodal Analysis) matrices.
 //!
-//! Mirrors `src/lib/sim/sparse.ts` 1-to-1.  Algorithm notes are in the TS
-//! file; this file is the Rust port.  Each public function has a matching
-//! TS unit test target in the existing codebase that the Rust tests check
-//! against (see `tests/parity.rs` for the cross-check vectors).
+//! This module provides a specialized sparse LU solver designed for the
+//! small, structurally stable matrices typical of circuit simulation (N ≤ 100).
+//! It uses a two-phase approach:
+//! 1. **Symbolic Phase**: Analyzes the matrix topology to determine fill-in and
+//!    pre-allocate row/column access lists.
+//! 2. **Numeric Phase**: Performs the actual factorization and solve using the
+//!    pre-computed pattern.
+//!
+//! To minimize fill-in (and thus floating-point operations), this module
+//! includes a Greedy Minimum Degree (MD) ordering algorithm to find an
+//! efficient elimination sequence.
 //!
 //! Performance notes
 //! -----------------
 //! - All inner loops index into preallocated buffers; no allocations in the
 //!   numeric kernel.
-//! - `numericFactor` and `sparseSolveInPlace` borrow the matrix mutably/
-//!   immutably so the caller controls the buffer.  No internal scratch.
-//! - We deliberately use safe indexing for the first port.  If profiling
-//!   shows bounds-check overhead dominates, we can switch to
-//!   `get_unchecked` in the hot loops — same approach as the TS version
-//!   which uses plain `arr[i]` rather than `arr.at(i)`.
+//! - `numeric_factor` and `sparse_solve_in_place` borrow the matrix mutably/
+//!   immutably so the caller controls the buffer.
+//! - Safe indexing is used throughout. Boundary checks are negligible for
+//!   the matrix sizes targeted by this simulator.
 
 const PIVOT_THRESHOLD: f64 = 1e-14;
 

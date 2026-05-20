@@ -1,17 +1,21 @@
 //! Netlist compilation: derive the static MNA structure from a `Netlist`.
 //!
-//! Mirrors the relevant bits of `compileNetlist` in `src/lib/sim/transient.ts`.
-//! Phase 3a scope:
-//! - Discover the set of non-ground nodes and assign compact indices.
-//! - Reorder via Minimum Degree to reduce LU fill.
-//! - Build the symbolic sparsity pattern for the MNA matrix.
-//! - Precompute static stamps (resistor conductances, voltage-source
-//!   incidence) so the Newton inner loop is allocation-free.
-//! - Precompute compact node indices for transistors, diodes, capacitors,
-//!   inductors so stamps don't traverse a HashMap.
+//! This module converts a high-level circuit description (`Netlist`) into a
+//! high-performance representation optimized for the Newton-Raphson solver.
 //!
-//! Phase 3b adds: inductor coupling (mutual inductance pairs), transformer
-//! elements, relay state machine, source-current diagnostic indices.
+//! Compilation Steps:
+//! 1. **Node Discovery**: Identifies all non-ground nodes and maps them to
+//!    compact MNA indices.
+//! 2. **Ordering**: Reorders nodes using a Minimum Degree (MD) algorithm to
+//!    reduce fill-in during LU factorization.
+//! 3. **Symbolic Analysis**: Builds the sparsity pattern for the system matrix.
+//! 4. **Stamping**: Pre-computes static stamps for linear elements (resistors,
+//!    voltage sources) and maps topology nodes to matrix indices for nonlinear
+//!    devices.
+//!
+//! The resulting `CompiledNetlist` contains all the pre-allocated buffers and
+//! pre-computed indices required to run the simulation without any dynamic
+//! allocations in the hot path.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -107,8 +111,11 @@ pub struct CompiledNetlist {
     pub relay_indices: Vec<usize>,
 }
 
-/// Compile a netlist.  Returns `None` if there are no non-ground nodes
-/// (an empty circuit) — every other error case is recoverable.
+/// Compiles a `Netlist` into a `CompiledNetlist`.
+///
+/// Returns `Some(compiled)` if the netlist is valid (has at least one
+/// non-ground node), or `None` if the netlist is empty or only contains
+/// ground connections.
 pub fn compile_netlist(netlist: &Netlist) -> Option<CompiledNetlist> {
     let ground = netlist.ground_node_id;
 

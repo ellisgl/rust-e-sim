@@ -1,29 +1,24 @@
 //! Netlist data structures.
 //!
-//! Mirrors the TypeScript `SimulationNetlist` and the `SimulationElement`
-//! union in `src/lib/types.ts`.  Elements are represented as a Rust enum
-//! rather than a tagged-union object — the Rust convention, and it lets
-//! us pattern-match in the compile/stamp paths without runtime type tags.
+//! This module defines the `Netlist` and its constituent `Element` types.
+//! It serves as the bridge between the high-level circuit description and
+//! the numerical solver.
 //!
-//! Phase 3a scope: resistor, capacitor, inductor (single-coil, no mutual
-//! coupling), voltage source, transistor (Phase 2 stamp), diode (Phase 2
-//! stamp).  Transformers, relays, and inductor coupling come in Phase 3b.
+//! Elements are represented as a Rust enum, allowing for efficient
+//! pattern-matching during the compilation and stamping phases.
 //!
-//! Node IDs are `u32` — they match topology-level node identifiers that
-//! the SvelteKit netlist builder produces.  Ground is conventionally
-//! `groundNodeId` (a specific u32 — there's no implicit "0 = ground"
-//! assumption).
-//!
-//! Element IDs are `String` so they round-trip with the TS
-//! `componentId: string`.  They're only used for diagnostics (source-
-//! current reporting in Phase 3b) so the allocation cost is paid once at
-//! netlist build time.
+//! Connectivity:
+//! - Node IDs are `u32` identifiers.
+//! - Ground is defined by a specific `ground_node_id` provided during construction.
+//! - Elements are connected between nodes; node 0 is commonly used as ground but
+//!   not required by the core.
 
 use crate::types::{Diode, Transistor};
+use serde::{Serialize, Deserialize};
 
 /// A single circuit element.  Each variant carries the topology nodes it
 /// connects to plus any model parameters needed by the stamp function.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Element {
     Resistor {
         id: String,
@@ -161,7 +156,7 @@ impl Element {
 /// The caller is responsible for assigning topology-level node IDs.  Ground
 /// is identified by `ground_node_id`; ground is at `0 V` in every solve.
 /// All other nodes are "non-ground" and get a compact MNA matrix row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Netlist {
     pub elements: Vec<Element>,
     pub ground_node_id: u32,

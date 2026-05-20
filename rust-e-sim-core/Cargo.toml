@@ -6,6 +6,7 @@ description = "Pure-Rust circuit simulation kernels"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
 [dev-dependencies]
 # Floating-point comparison helpers for the test suite.
 approx = "0.5.1"

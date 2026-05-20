@@ -1,19 +1,32 @@
-//! Pure-Rust simulation kernels
+//! High-performance circuit simulation kernels.
 //!
-//! This crate is a faithful port of the TypeScript simulator in
-//! `src/lib/sim/`.  Each algorithm here has a matching test that produces
-//! the same numerical output (within floating-point tolerance) as the
-//! reference TypeScript implementation.
+//! This crate provides the core numerical engines for the `rust-e-sim` simulator.
+//! It implements Modified Nodal Analysis (MNA), sparse LU factorization, and
+//! nonlinear transient analysis using Newton-Raphson iteration.
 //!
-//! Layering
-//! --------
-//! - `sparse`    — symbolic + numeric sparse LU, Minimum-Degree reordering.
-//!                 No element types here; pure linear algebra.
-//! - (later)    — element types, MNA stamping, Newton solver, BDF-2 loop.
+//! Architecture
+//! ----------
+//! The simulator is built in layers:
+//! - `sparse`    — Linear algebra: symbolic and numeric sparse LU factorization,
+//!                 Minimum-Degree reordering for fill-in reduction.
+//! - `linear`    — Fallback dense Gaussian elimination for singular systems.
+//! - `netlist`   — Circuit topology and element definitions.
+//! - `compile`   — Static analysis: converts a netlist into a fixed MNA structure
+//!                 with pre-computed stamps.
+//! - `transient` — The main solver loop: Newton-Raphson iteration with Backward
+//!                 Euler and BDF-2 (Gear-2) integration.
 //!
-//! The crate is intentionally `no_std`-friendly except where Vec is needed
-//! for variable-length scratch.  Future work could replace those with
-//! statically-sized buffers passed in by the caller.
+//! Numerical Stability
+//! -------------------
+//! The simulation kernels use several SPICE-style techniques to ensure convergence
+//! and stability:
+//! - `GMIN` stepping/regularisation for near-singular matrices.
+//! - `pnjlim` voltage limiting for diodes and transistors.
+//! - Symbolic fill-in propagation during LU factorization.
+//! - Dense fallback for sparse factorization failures.
+//!
+//! This crate is `no_std`-compatible (with `alloc`) as it avoids OS-specific
+//! APIs and only requires dynamic memory for sparse structures.
 
 pub mod sparse;
 pub mod types;

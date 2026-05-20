@@ -1,22 +1,17 @@
-//! Element parameter types.
+//! Element parameter types and model definitions.
 //!
-//! Plain-old-data Rust structs that mirror the TypeScript `Simulation*`
-//! element interfaces from `src/lib/types.ts`.  Only the fields the stamp
-//! functions need are included — `componentId`, polarity, model parameters,
-//! and optional model knobs.
+//! This module defines the data structures used to describe circuit components
+//! and their physical parameters (e.g., transistor Gummel-Poon parameters,
+//! diode saturation currents).
 //!
-//! Nodes are NOT stored here.  In TS the element types carry compact node
-//! indices for convenience; the stamps take those as separate arguments.
-//! We do the same in Rust so a single `Transistor` struct can describe
-//! multiple physical instances if needed and so the test code can build
-//! a stamp call without constructing fake node graphs.
-//!
-//! Optional fields use `Option<f64>` with the same defaults as TS:
-//! the stamp functions apply the defaults at call time, matching the
-//! reference behaviour exactly.
+//! These structs are "pure model" definitions — they carry the physical
+//! constants of a component but do not store connectivity (nodes).
+//! Connectivity is handled at the `Netlist` and `CompiledNetlist` layers.
+
+use serde::{Serialize, Deserialize};
 
 /// NPN or PNP polarity for a BJT.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Polarity {
     Npn,
     Pnp,
@@ -24,7 +19,7 @@ pub enum Polarity {
 
 /// Gummel-Poon BJT parameters.  See SPICE 3 documentation for the canonical
 /// definitions; this struct mirrors the names used in `transistor.ts`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Transistor {
     pub polarity: Polarity,
     /// Forward beta (bf).
@@ -98,7 +93,7 @@ impl Transistor {
 }
 
 /// Shockley diode with optional Zener reverse breakdown.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Diode {
     /// Saturation current (A).
     pub is: f64,

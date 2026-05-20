@@ -1,21 +1,22 @@
-//! Transient solver — Newton-Raphson on the MNA system with Backward Euler
-//! integration.
+//! Transient solver — Newton-Raphson on the MNA system with adaptive integration.
 //!
-//! Phase 3a port of `stepTransientNetlist` in `src/lib/sim/transient.ts`.
-//! Scope is intentionally minimal so we can verify correctness against the
-//! TypeScript reference before adding the perf features in Phase 3b:
-//!   - Backward Euler only (no BDF-2/Gear-2).
-//!   - No predictor warm-start (Newton starts from previous-step state).
-//!   - No adaptive dt — caller picks dt.
-//!   - Single-coil inductors only (no mutual inductance).
-//!   - No relay state machine, no source-current diagnostics.
+//! This module implements the main simulation loop for nonlinear transient
+//! analysis. It uses a predictor-corrector approach:
+//! 1. **Predictor**: Extrapolates the next state from previous time-steps to
+//!    provide a better initial guess for Newton's method.
+//! 2. **Corrector**: Refines the state using Newton-Raphson iteration on the
+//!    Modified Nodal Analysis (MNA) system.
 //!
-//! The Newton inner loop pattern matches the TS reference: build a "base"
-//! matrix/RHS from everything that's constant across iterations (static
-//! stamps + capacitor companions + inductor companions + voltage-source
-//! RHS + gmin), then within each iteration restore from the base, stamp
-//! the nonlinear contributions (transistors, diodes), factor, solve, and
-//! check the update against a convergence tolerance.
+//! Integration Methods
+//! -------------------
+//! Supports two implicit integration schemes:
+//! - **Backward Euler (BE)**: Robust first-order method, used on the first step
+//!   and after any discontinuity (e.g., relay toggle).
+//! - **BDF-2 (Gear-2)**: Second-order method used for higher accuracy in
+//!   smooth regions of the simulation.
+//!
+//! Numerical stability is maintained through SPICE-style voltage limiting
+//! (`pnjlim`) for nonlinear devices and `GMIN` regularisation.
 
 use crate::compile::CompiledNetlist;
 use crate::diode::compute_diode_stamp;
@@ -23,12 +24,13 @@ use crate::linear::solve_linear_system;
 use crate::netlist::Element;
 use crate::sparse::{numeric_factor, sparse_solve_in_place};
 use crate::transistor::compute_transistor_stamp;
+use serde::{Serialize, Deserialize};
 
 /// Mutable per-step solver state.
 ///
-/// Phase 3a fields only — Phase 3b adds `prev_*` history buffers for BDF-2,
-/// `avg_iter_count` for adaptive iteration ceiling, etc.
-#[derive(Debug, Clone)]
+/// Holds the history buffers required for multi-step integration (BDF-2)
+/// and the current operating point for nonlinear devices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransientState {
     /// Node voltages in compact MNA order.  Length = `compiled.n`.
     pub node_volts: Vec<f64>,
@@ -104,16 +106,12 @@ pub enum StepIssue {
     BadTimestep,
 }
 
-/// Step configuration knobs.
-///
-/// Mirrors the TS `TransientConfig` partially — Phase 3b adds gear,
-/// Phase 3c will add adaptive-dt and source-current diagnostics.
+/// Step configuration parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct StepConfig {
+    /// Timestep duration (seconds).
     pub dt: f64,
-    /// Integration order.  `BDF2` uses second-order BDF whenever
-    /// `state.gear2_ready` is set; falls back to BE on the first step.
-    /// `Be` forces backward Euler unconditionally.
+    /// Integration method: Backward Euler or BDF-2.
     pub gear: Gear,
 }
 
@@ -143,11 +141,11 @@ const STEP_LIMIT: f64 = 1.0; // V — per-iteration voltage clamp
 /// large dt jumps or topology changes.
 const PREDICTOR_CLIP: f64 = 1.5;
 
-/// Maximum Newton iterations.  Matches the TS reference's `baseIterLimit`
-/// computation: 1 for linear, 10 for diode-only, 20 for transistor-bearing
-/// (relay path is Phase 3b).  Linear systems are effectively step-limited
-/// rather than Newton-iterated; this is intentional and matches TS so
-/// parity holds step-by-step.
+/// Maximum Newton iterations allowed for the current netlist.
+///
+/// Returns a budget based on the complexity of the circuit (number of
+/// transistors, diodes, and relays). Nonlinear circuits require more
+/// iterations to reach convergence.
 fn total_iterations(transistor_count: usize, diode_count: usize, relay_count: usize) -> usize {
     let q_iter = if transistor_count > 0 { 20 } else { 1 };
     let d_iter = if diode_count > 0 { 10 } else { 1 };
@@ -166,22 +164,10 @@ pub enum DcIssue {
     DidNotConverge,
 }
 
-/// Solve the DC operating point and write results into `state`.
+/// Solve the DC operating point of the circuit.
 ///
-/// Treats capacitors as open (skip the cap companion stamps) and inductors
-/// as shorts (no branch-row L/dt coefficient — just the incidence terms
-/// from static stamps enforce V_a = V_b).  Voltage sources, resistors,
-/// transistors, and diodes participate as usual.
-///
-/// Mirrors `solveDcNetlist` in `src/lib/sim/dc.ts`: same matrix structure,
-/// same transistor warm-start (Vb≈0.6, Vc≈Vcc/2, Ve≈0 for NPN; PNP mirror),
-/// same Gummel-style Newton with step-limit + damping.
-///
-/// On success, populates `state.node_volts`, derives `state.cap_volts` from
-/// node-voltage differences (caps charge to the steady-state voltage across
-/// them), reads `state.inductor_currents` from the branch rows, and clears
-/// `state.gear2_ready` so the FIRST transient step after DC uses BE
-/// (matches TS — BDF-2 only after we have a real transient history).
+/// Capacitors are treated as open circuits and inductors as short circuits.
+/// Returns the number of Newton iterations required to reach convergence.
 pub fn solve_dc(
     c: &mut CompiledNetlist,
     state: &mut TransientState,
@@ -318,7 +304,7 @@ pub fn solve_dc(
             }
         }
 
-        // Stamp relays at the de-energised state.  Phase 4-cont: TS also
+        // Stamp relays at the de-energised state.  TS also
         // iterates the relay state machine during DC (up to 5 outer
         // iters), so a circuit whose steady-state current trips a relay
         // at power-on would already be in the correct rest state.  Here
@@ -466,8 +452,7 @@ pub fn solve_dc(
     Ok(actual_iters)
 }
 
-/// Backward-compatible wrapper: call `step_with_config` with BE and the
-/// given dt.  Existing tests + the simple Simulator API path use this.
+/// Advances the simulation by one timestep using Backward Euler.
 pub fn step(
     c: &mut CompiledNetlist,
     state: &mut TransientState,
@@ -476,16 +461,7 @@ pub fn step(
     step_with_config(c, state, StepConfig::be(dt))
 }
 
-/// Advance the simulation by one timestep.  Mutates `state` in place.
-///
-/// Returns `Ok(iter_count)` on success or `Err(issue)` if the step failed.
-/// On failure, `state` is left unchanged (the Newton loop wrote into
-/// scratch buffers, not into `state`).
-///
-/// Integration order is selected by `config.gear`.  `Be` is unconditionally
-/// backward Euler.  `Bdf2` uses second-order BDF whenever there's a usable
-/// previous step (`state.gear2_ready`); otherwise it falls back to BE for
-/// the first step, matching the TS reference behavior.
+/// Advances the simulation by one timestep using the specified configuration.
 pub fn step_with_config(
     c: &mut CompiledNetlist,
     state: &mut TransientState,
@@ -636,8 +612,6 @@ pub fn step_with_config(
         p += 3;
     }
 
-    // ── Initial Newton estimate ─────────────────────────────────────────
-    // Without a predictor (Phase 3b adds one), we start from the previous
     // ── Initial Newton estimate ─────────────────────────────────────────
     // Layout matches MNA matrix rows.  Without a predictor, this is just
     // the previous step's node voltages.  With a predictor (gear2_ready +
@@ -985,7 +959,7 @@ pub fn step_with_config(
     }
 
     // Transistor junction-cap voltages (Vbe, Vbc) — kept consistent with
-    // TS even though Phase 3b doesn't yet use them in the cap companion.
+    // TS even though it doesn't yet use them in the cap companion.
     for ti in 0..c.transistor_count {
         let bi = c.transistor_node_indices[ti * 3];
         let ci_ = c.transistor_node_indices[ti * 3 + 1];
@@ -1277,8 +1251,8 @@ mod tests {
     // Note: an isolated common-emitter BJT DC bias test was tried here and
     // removed.  Cold-start Newton convergence on a bipolar in the active
     // region is a known-hard case — the TypeScript reference uses a separate
-    // `dc.ts` operating-point solve to warm-start the transient.  Phase 3b
-    // adds that path; for now, the BJT code path is verified by the TS
+    // `dc.ts` operating-point solve to warm-start the transient.  The BJT
+    // code path is verified by the TS
     // parity vector in `tests/parity_circuit.rs`, which uses a real
     // metronome-style RC + BJT circuit and matches TS output step-for-step.
 
@@ -1337,7 +1311,7 @@ mod tests {
         assert!(!state.gear2_ready);
     }
 
-    /// Phase 3c — basic transformer (mutual-inductance) sanity test.
+    /// Basic transformer (mutual-inductance) sanity test.
     /// Two coupled inductors with k=0.9; driving the primary should induce
     /// a non-zero secondary voltage proportional to the coupling.
     ///
