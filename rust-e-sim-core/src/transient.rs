@@ -578,7 +578,7 @@ pub fn step_with_config(
     // The branch equation is V_a − V_b − coeff·I_new = -rhs.
     //
     // Inductor saturation: when |I_prev| exceeds `saturation_current_a`,
-    // the effective inductance drops to 1% of nominal (core saturates,
+    // the effective inductance drops to 1% of nominal (rust-e-sim-core saturates,
     // inductance collapses).  Matches the TS reference's simple two-state
     // saturation model.
     for li in 0..c.inductor_count {
@@ -1356,19 +1356,19 @@ mod tests {
         nl.push(Element::Inductor {
             id: "L1".into(), a: 2, b: 0, inductance_henry: 1e-3,
             saturation_current_a: None,
-            coupling_group: Some("core".into()), coupling_polarity: 1,
+            coupling_group: Some("rust-e-sim-core".into()), coupling_polarity: 1,
         });
         // Secondary loop: L2 (1mH) → 100Ω load → gnd.  Open from primary.
         nl.push(Element::Inductor {
             id: "L2".into(), a: 3, b: 0, inductance_henry: 1e-3,
             saturation_current_a: None,
-            coupling_group: Some("core".into()), coupling_polarity: 1,
+            coupling_group: Some("rust-e-sim-core".into()), coupling_polarity: 1,
         });
         nl.push(Element::Resistor {
             id: "Rload".into(), a: 3, b: 0, resistance_ohms: 100.0,
         });
         nl.push(Element::Coupling {
-            id: "K".into(), coupling_group: "core".into(), k: 0.9,
+            id: "K".into(), coupling_group: "rust-e-sim-core".into(), k: 0.9,
         });
 
         let mut c = compile_netlist(&nl).unwrap();
@@ -1413,12 +1413,12 @@ mod tests {
         nl.push(Element::Inductor {
             id: "L1".into(), a: 2, b: 0, inductance_henry: 1e-3,
             saturation_current_a: None,
-            coupling_group: Some("core".into()), coupling_polarity: 1,
+            coupling_group: Some("rust-e-sim-core".into()), coupling_polarity: 1,
         });
         nl.push(Element::Inductor {
             id: "L2".into(), a: 3, b: 0, inductance_henry: 1e-3,
             saturation_current_a: None,
-            coupling_group: Some("core".into()), coupling_polarity: 1,
+            coupling_group: Some("rust-e-sim-core".into()), coupling_polarity: 1,
         });
         nl.push(Element::Resistor {
             id: "Rload".into(), a: 3, b: 0, resistance_ohms: 100.0,

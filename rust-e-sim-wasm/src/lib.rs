@@ -1,4 +1,4 @@
-//! WASM bindings for sim-core.
+//! WASM bindings for sim-rust-e-sim-core.
 //!
 //! Phase 1: expose the sparse LU module so the integration test can verify
 //! Rust output matches the TypeScript reference on a real Newton iteration.
@@ -12,10 +12,10 @@
 //!   this is fine: `analyze_pattern` runs once per compile and the sparse
 //!   solver runs maybe 50-100k times/sec — copies of n-sized typed arrays
 //!   (n ≤ ~40) cost microseconds.
-//! - When we get to Phase 3/4 the simulator OWNS its buffers inside the wasm
+//! - When we get to Phase 3/4 the simulator OWNS its buffers inside the rust-e-sim-wasm
 //!   linear memory; only audio samples and UI snapshots cross the boundary.
-//! - `SparseLuPattern` is opaque to JS — it stays in wasm memory, and JS
-//!   holds an `extern "C"` handle returned by wasm-bindgen.
+//! - `SparseLuPattern` is opaque to JS — it stays in rust-e-sim-wasm memory, and JS
+//!   holds an `extern "C"` handle returned by rust-e-sim-wasm-bindgen.
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -35,10 +35,10 @@ pub fn ping(x: f64) -> f64 {
 ///
 /// JS receives a number-typed handle that it threads back into
 /// `numeric_factor` and `sparse_solve_in_place`.  The pattern data itself
-/// lives in wasm linear memory and is never serialized across the boundary.
+/// lives in rust-e-sim-wasm linear memory and is never serialized across the boundary.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct SparseLuPattern {
-    inner: sim_core::sparse::SparseLuPattern,
+    inner: rust_e_sim_core::sparse::SparseLuPattern,
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -57,7 +57,7 @@ impl SparseLuPattern {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = analyzePattern))]
 pub fn analyze_pattern(marker: &[u8], n: usize) -> SparseLuPattern {
     SparseLuPattern {
-        inner: sim_core::sparse::analyze_pattern(marker, n),
+        inner: rust_e_sim_core::sparse::analyze_pattern(marker, n),
     }
 }
 
@@ -68,7 +68,7 @@ pub fn analyze_pattern(marker: &[u8], n: usize) -> SparseLuPattern {
 /// store U.  Returns `false` if a pivot fell below the numerical threshold.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = numericFactor))]
 pub fn numeric_factor(mat: &mut [f64], n: usize, pat: &SparseLuPattern) -> bool {
-    sim_core::sparse::numeric_factor(mat, n, &pat.inner)
+    rust_e_sim_core::sparse::numeric_factor(mat, n, &pat.inner)
 }
 
 /// Solve `(L * U) * x = rhs` using a matrix already factored by
@@ -80,7 +80,7 @@ pub fn sparse_solve_in_place(
     n: usize,
     pat: &SparseLuPattern,
 ) {
-    sim_core::sparse::sparse_solve_in_place(mat, rhs, n, &pat.inner);
+    rust_e_sim_core::sparse::sparse_solve_in_place(mat, rhs, n, &pat.inner);
 }
 
 /// Greedy Minimum Degree elimination ordering.
@@ -95,7 +95,7 @@ pub fn minimum_degree_order(n: usize, flat_edges: &[i32]) -> Vec<i32> {
     let edges = flat_edges
         .chunks_exact(2)
         .map(|c| (c[0] as usize, c[1] as usize));
-    sim_core::sparse::minimum_degree_order(n, edges).into_vec()
+    rust_e_sim_core::sparse::minimum_degree_order(n, edges).into_vec()
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -104,23 +104,23 @@ pub fn minimum_degree_order(n: usize, flat_edges: &[i32]) -> Vec<i32> {
 //
 // Design notes
 // ------------
-// Elements (Diode, Transistor) are exposed as opaque wasm-bindgen classes.
+// Elements (Diode, Transistor) are exposed as opaque rust-e-sim-wasm-bindgen classes.
 // JS constructs each instance via a flat-argument constructor that mirrors
 // the TypeScript Simulation*Element interfaces, then passes the handle into
 // the stamp functions.
 //
-// Stamp results come back as wasm-bindgen structs with getter properties.
+// Stamp results come back as rust-e-sim-wasm-bindgen structs with getter properties.
 // Field names match the TS output object (`gBe`, `gMu`, `iEqB`, …) via
 // `#[wasm_bindgen(js_name = …)]` so the JS adapter is a thin pass-through.
 //
 // `Float64Array` arguments cross by COPY at this layer — same trade-off
 // rationale as the sparse module.  Per-call cost is microseconds; the hot
 // path will eventually go through the Phase-3 Simulator class that owns
-// its buffers inside wasm memory.
+// its buffers inside rust-e-sim-wasm memory.
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct Diode {
-    inner: sim_core::types::Diode,
+    inner: rust_e_sim_core::types::Diode,
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -128,14 +128,14 @@ impl Diode {
     /// Plain Shockley diode with no Zener breakdown.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
     pub fn shockley(is: f64, n: f64) -> Diode {
-        Diode { inner: sim_core::types::Diode::shockley(is, n) }
+        Diode { inner: rust_e_sim_core::types::Diode::shockley(is, n) }
     }
 
     /// Zener diode with reverse breakdown at `bv` volts.  `ibv` defaults to
     /// 1e-3 A in the model if not supplied (pass `None` from JS).
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
     pub fn zener(is: f64, n: f64, bv: f64, ibv: Option<f64>) -> Diode {
-        let mut d = sim_core::types::Diode::zener(is, n, bv);
+        let mut d = rust_e_sim_core::types::Diode::zener(is, n, bv);
         d.ibv = ibv;
         Diode { inner: d }
     }
@@ -143,7 +143,7 @@ impl Diode {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct DiodeStamp {
-    inner: sim_core::diode::DiodeStamp,
+    inner: rust_e_sim_core::diode::DiodeStamp,
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -167,7 +167,7 @@ pub fn compute_diode_stamp_js(
     ki: i32,
     prev_volts: Option<Vec<f64>>,
 ) -> DiodeStamp {
-    let stamp = sim_core::diode::compute_diode_stamp(
+    let stamp = rust_e_sim_core::diode::compute_diode_stamp(
         &diode.inner, volts, ai, ki, prev_volts.as_deref(),
     );
     DiodeStamp { inner: stamp }
@@ -175,7 +175,7 @@ pub fn compute_diode_stamp_js(
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct Transistor {
-    inner: sim_core::types::Transistor,
+    inner: rust_e_sim_core::types::Transistor,
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -184,7 +184,7 @@ impl Transistor {
     /// `undefined` on the JS side; defaults are applied inside the stamp
     /// function to match the TS reference exactly.
     ///
-    /// `polarity_npn` is a boolean instead of a string because wasm-bindgen
+    /// `polarity_npn` is a boolean instead of a string because rust-e-sim-wasm-bindgen
     /// doesn't transparently marshal string enums.  JS adapter translates
     /// `polarity === 'npn'` → `true`, `'pnp'` → `false`.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(constructor))]
@@ -209,9 +209,9 @@ impl Transistor {
         tf_seconds: Option<f64>,
         tr_seconds: Option<f64>,
     ) -> Transistor {
-        use sim_core::types::Polarity;
+        use rust_e_sim_core::types::Polarity;
         Transistor {
-            inner: sim_core::types::Transistor {
+            inner: rust_e_sim_core::types::Transistor {
                 polarity: if polarity_npn { Polarity::Npn } else { Polarity::Pnp },
                 beta, is: is_sat, nf, vaf, cje_farads, cjc_farads,
                 br, nr, var_, ikf, ikr, ise, ne, isc, nc, tf_seconds, tr_seconds,
@@ -222,7 +222,7 @@ impl Transistor {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct TransistorStamp {
-    inner: sim_core::transistor::TransistorStamp,
+    inner: rust_e_sim_core::transistor::TransistorStamp,
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -259,7 +259,7 @@ pub fn compute_transistor_stamp_js(
     ei: i32,
     prev_volts: Option<Vec<f64>>,
 ) -> TransistorStamp {
-    let stamp = sim_core::transistor::compute_transistor_stamp(
+    let stamp = rust_e_sim_core::transistor::compute_transistor_stamp(
         &q.inner, volts, bi, ci, ei, prev_volts.as_deref(),
     );
     TransistorStamp { inner: stamp }
@@ -285,23 +285,23 @@ pub fn compute_transistor_stamp_js(
 //   kit netlist has ~30-60 elements, so the per-call boundary cost is
 //   irrelevant.
 // - `step(dt)` is the hot path.  It does NOT allocate, does NOT copy any
-//   buffers across the boundary: matrix and solution all live in wasm
+//   buffers across the boundary: matrix and solution all live in rust-e-sim-wasm
 //   memory.  JS only sees the step status (`Ok(iter_count)` as a u32 or
 //   error code).
 // - `node_voltage` is the only voltage accessor; for steady-state probing.
 //   In Phase 4 the AudioWorklet path will instead drain a ring buffer
-//   directly from wasm memory.
+//   directly from rust-e-sim-wasm memory.
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct Simulator {
-    netlist: sim_core::netlist::Netlist,
+    netlist: rust_e_sim_core::netlist::Netlist,
     /// `None` until `compile()` has been called.  Subsequent `add_*` calls
     /// invalidate the compile (set this back to `None`).
-    compiled: Option<sim_core::compile::CompiledNetlist>,
-    state: Option<sim_core::transient::TransientState>,
+    compiled: Option<rust_e_sim_core::compile::CompiledNetlist>,
+    state: Option<rust_e_sim_core::transient::TransientState>,
 }
 
-/// Outcome of a `step()` call, marshalled across the wasm boundary as a
+/// Outcome of a `step()` call, marshalled across the rust-e-sim-wasm boundary as a
 /// small enum.  JS gets back either an iteration count (success) or a
 /// negative error code.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -321,7 +321,7 @@ impl Simulator {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(constructor))]
     pub fn new(ground_node_id: u32) -> Simulator {
         Simulator {
-            netlist: sim_core::netlist::Netlist::new(ground_node_id),
+            netlist: rust_e_sim_core::netlist::Netlist::new(ground_node_id),
             compiled: None,
             state: None,
         }
@@ -329,7 +329,7 @@ impl Simulator {
 
     pub fn add_resistor(&mut self, id: String, a: u32, b: u32, resistance_ohms: f64) {
         self.invalidate();
-        self.netlist.push(sim_core::netlist::Element::Resistor {
+        self.netlist.push(rust_e_sim_core::netlist::Element::Resistor {
             id, a, b, resistance_ohms,
         });
     }
@@ -339,7 +339,7 @@ impl Simulator {
         capacitance_farads: f64, initial_voltage: f64,
     ) {
         self.invalidate();
-        self.netlist.push(sim_core::netlist::Element::Capacitor {
+        self.netlist.push(rust_e_sim_core::netlist::Element::Capacitor {
             id, a, b, capacitance_farads, initial_voltage,
         });
     }
@@ -354,7 +354,7 @@ impl Simulator {
         coupling_group: Option<String>, coupling_polarity: Option<i32>,
     ) {
         self.invalidate();
-        self.netlist.push(sim_core::netlist::Element::Inductor {
+        self.netlist.push(rust_e_sim_core::netlist::Element::Inductor {
             id, a, b, inductance_henry, saturation_current_a,
             coupling_group,
             coupling_polarity: coupling_polarity.unwrap_or(1),
@@ -367,7 +367,7 @@ impl Simulator {
     /// inductors in the group is `M = k · sqrt(Li · Lj) · si · sj`.
     pub fn add_coupling(&mut self, id: String, coupling_group: String, k: f64) {
         self.invalidate();
-        self.netlist.push(sim_core::netlist::Element::Coupling {
+        self.netlist.push(rust_e_sim_core::netlist::Element::Coupling {
             id, coupling_group, k,
         });
     }
@@ -376,14 +376,14 @@ impl Simulator {
         &mut self, id: String, positive_node: u32, negative_node: u32, voltage: f64,
     ) {
         self.invalidate();
-        self.netlist.push(sim_core::netlist::Element::VoltageSource {
+        self.netlist.push(rust_e_sim_core::netlist::Element::VoltageSource {
             id, positive_node, negative_node, voltage,
         });
     }
 
     pub fn add_diode(&mut self, id: String, anode: u32, cathode: u32, diode: &Diode) {
         self.invalidate();
-        self.netlist.push(sim_core::netlist::Element::Diode {
+        self.netlist.push(rust_e_sim_core::netlist::Element::Diode {
             id, anode, cathode, params: diode.inner,
         });
     }
@@ -392,7 +392,7 @@ impl Simulator {
         &mut self, id: String, base: u32, collector: u32, emitter: u32, q: &Transistor,
     ) {
         self.invalidate();
-        self.netlist.push(sim_core::netlist::Element::Transistor {
+        self.netlist.push(rust_e_sim_core::netlist::Element::Transistor {
             id, base, collector, emitter, params: q.inner,
         });
     }
@@ -416,7 +416,7 @@ impl Simulator {
         on_current: f64, off_current: f64,
     ) {
         self.invalidate();
-        self.netlist.push(sim_core::netlist::Element::Relay {
+        self.netlist.push(rust_e_sim_core::netlist::Element::Relay {
             id,
             coil_positive, coil_negative,
             common, normally_closed, normally_open,
@@ -431,9 +431,9 @@ impl Simulator {
     /// success; `false` if the netlist has no non-ground nodes (empty
     /// circuit).
     pub fn compile(&mut self) -> bool {
-        match sim_core::compile::compile_netlist(&self.netlist) {
+        match rust_e_sim_core::compile::compile_netlist(&self.netlist) {
             Some(c) => {
-                let state = sim_core::transient::TransientState::new(&c);
+                let state = rust_e_sim_core::transient::TransientState::new(&c);
                 self.compiled = Some(c);
                 self.state = Some(state);
                 true
@@ -459,16 +459,16 @@ impl Simulator {
             None => return StepResult { ok: false, iters: 0, issue: 3 },
         };
         let cfg = match gear {
-            2 => sim_core::transient::StepConfig::bdf2(dt),
-            _ => sim_core::transient::StepConfig::be(dt),
+            2 => rust_e_sim_core::transient::StepConfig::bdf2(dt),
+            _ => rust_e_sim_core::transient::StepConfig::be(dt),
         };
-        match sim_core::transient::step_with_config(c, s, cfg) {
+        match rust_e_sim_core::transient::step_with_config(c, s, cfg) {
             Ok(iters) => StepResult { ok: true, iters: iters as u32, issue: 0 },
-            Err(sim_core::transient::StepIssue::SingularMatrix) =>
+            Err(rust_e_sim_core::transient::StepIssue::SingularMatrix) =>
                 StepResult { ok: false, iters: 0, issue: 1 },
-            Err(sim_core::transient::StepIssue::NewtonDidNotConverge) =>
+            Err(rust_e_sim_core::transient::StepIssue::NewtonDidNotConverge) =>
                 StepResult { ok: false, iters: 0, issue: 2 },
-            Err(sim_core::transient::StepIssue::BadTimestep) =>
+            Err(rust_e_sim_core::transient::StepIssue::BadTimestep) =>
                 StepResult { ok: false, iters: 0, issue: 3 },
         }
     }
@@ -491,7 +491,7 @@ impl Simulator {
             Some(s) => s,
             None => return false,
         };
-        sim_core::transient::solve_dc(c, s).is_ok()
+        rust_e_sim_core::transient::solve_dc(c, s).is_ok()
     }
 
     /// Voltage at a topology node ID — 0.0 if the node is grounded or
@@ -531,7 +531,7 @@ impl Simulator {
             _ => return 0.0,
         };
         for (vi, &el_idx) in c.voltage_source_indices.iter().enumerate() {
-            if let sim_core::netlist::Element::VoltageSource { id: el_id, .. } = &c.elements[el_idx] {
+            if let rust_e_sim_core::netlist::Element::VoltageSource { id: el_id, .. } = &c.elements[el_idx] {
                 if el_id == id {
                     return s.voltage_source_currents[vi];
                 }
@@ -555,7 +555,7 @@ impl Simulator {
             _ => return 0.0,
         };
         for (li, &el_idx) in c.inductor_indices.iter().enumerate() {
-            if let sim_core::netlist::Element::Inductor { id: el_id, .. } = &c.elements[el_idx] {
+            if let rust_e_sim_core::netlist::Element::Inductor { id: el_id, .. } = &c.elements[el_idx] {
                 if el_id == id {
                     return s.inductor_currents[li];
                 }
@@ -653,7 +653,7 @@ impl Simulator {
 
     /// Snapshot of relay active flags (`true` = energised).  Returned as
     /// `Vec<u8>` since `Vec<bool>` isn't natively exposable through
-    /// wasm-bindgen; 0/1 encoding.
+    /// rust-e-sim-wasm-bindgen; 0/1 encoding.
     pub fn export_relay_active(&self) -> Vec<u8> {
         self.state.as_ref()
             .map(|s| s.relay_active.iter().map(|&b| if b { 1 } else { 0 }).collect())
@@ -690,7 +690,7 @@ impl Simulator {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Host-side tests — exercise the same code that the wasm build will run
+// Host-side tests — exercise the same code that the rust-e-sim-wasm build will run
 // ────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -704,8 +704,8 @@ mod tests {
 
     #[test]
     fn analyze_factor_solve_end_to_end() {
-        // Same 3×3 system as the core unit test, but driven through the
-        // wasm-bindgen-facing API to catch any boundary glue issues.
+        // Same 3×3 system as the rust-e-sim-core unit test, but driven through the
+        // rust-e-sim-wasm-bindgen-facing API to catch any boundary glue issues.
         let n = 3;
         let marker = vec![1u8; n * n];
         let pat = analyze_pattern(&marker, n);
@@ -735,7 +735,7 @@ mod tests {
 
     #[test]
     fn diode_and_transistor_through_wasm_layer() {
-        // Sanity: drive the wasm-bindgen-facing API end-to-end on host so we
+        // Sanity: drive the rust-e-sim-wasm-bindgen-facing API end-to-end on host so we
         // catch any glue regressions before they hit the browser.
         let d = Diode::shockley(1e-14, 1.0);
         let volts = vec![0.7, 0.0];
@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(sim.node_voltage(999), 0.0);
     }
 
-    /// Phase 3b — DC + BDF-2 + predictor end-to-end through the wasm-bindgen
+    /// Phase 3b — DC + BDF-2 + predictor end-to-end through the rust-e-sim-wasm-bindgen
     /// API.  Voltage-divider biased common-emitter BJT.  `solve_dc()`
     /// establishes the operating point (parity-checked against TS);
     /// subsequent transient steps run without solver errors.
