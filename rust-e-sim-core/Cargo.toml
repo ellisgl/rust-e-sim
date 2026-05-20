@@ -1,0 +1,11 @@
+[package]
+name = "rust-e-sim-core"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust circuit simulation kernels"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+[dev-dependencies]
+# Floating-point comparison helpers for the test suite.
+approx = "0.5.1"
