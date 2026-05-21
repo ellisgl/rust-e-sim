@@ -476,6 +476,61 @@ impl Simulator {
         }
     }
 
+    /// Audio-hot-path step variant that returns a packed `u32` instead of
+    /// a wasm-bindgen-managed `StepResult` struct.
+    ///
+    /// Why this exists: every `step_with_gear` call returning `StepResult`
+    /// costs ~5 JS↔WASM boundary crossings (the call itself, the wasm
+    /// alloc for the struct, the JS wrapper construction, getter calls
+    /// for `.ok`/`.iters`/`.issue`, and the final `.free()` to release
+    /// the wasm allocation).  At ~1-3 µs per crossing in Chrome, that's
+    /// 10-15 µs of pure overhead per step before any actual sim work.
+    ///
+    /// In the AudioWorklet this is called ~128-256 times per quantum
+    /// (2.67 ms of audio).  The overhead alone consumes most of the
+    /// quantum budget — causing the worklet to fall behind realtime and
+    /// Chrome to drop quanta (the user hears silence even though the
+    /// simulator output is correct).
+    ///
+    /// Encoding of the returned `u32` (little-endian bit layout):
+    /// ```text
+    ///   bit 0       : ok    (1 = success, 0 = failure)
+    ///   bits 1..=7  : issue (0 = ok, 1 = singular, 2 = no-converge, 3 = bad-dt)
+    ///   bits 8..=31 : iters (24-bit Newton iteration count, plenty)
+    /// ```
+    ///
+    /// JS unpacking:
+    /// ```js
+    /// const r = sim.step_with_gear_packed(dt, 2);
+    /// const ok    = (r & 1) !== 0;
+    /// const issue = (r >> 1) & 0x7f;
+    /// const iters = r >>> 8;
+    /// ```
+    ///
+    /// One wasm call, one number, no alloc, no `.free()`.  Functionally
+    /// identical to `step_with_gear` — uses the exact same Rust step
+    /// kernel underneath; only the return-value plumbing differs.
+    pub fn step_with_gear_packed(&mut self, dt: f64, gear: u8) -> u32 {
+        let c = match self.compiled.as_mut() {
+            Some(c) => c,
+            None    => return 3u32 << 1,   // ok=0, issue=3 (no compiled netlist)
+        };
+        let s = match self.state.as_mut() {
+            Some(s) => s,
+            None    => return 3u32 << 1,
+        };
+        let cfg = match gear {
+            2 => rust_e_sim_core::transient::StepConfig::bdf2(dt),
+            _ => rust_e_sim_core::transient::StepConfig::be(dt),
+        };
+        match rust_e_sim_core::transient::step_with_config(c, s, cfg) {
+            Ok(iters) => 1u32 | ((iters as u32 & 0x00FF_FFFF) << 8),
+            Err(rust_e_sim_core::transient::StepIssue::SingularMatrix)       => 1u32 << 1,
+            Err(rust_e_sim_core::transient::StepIssue::NewtonDidNotConverge) => 2u32 << 1,
+            Err(rust_e_sim_core::transient::StepIssue::BadTimestep)          => 3u32 << 1,
+        }
+    }
+
     /// Solve for the DC operating point and write the result into the
     /// transient state.  Caps are treated as open, inductors as shorts.
     /// Must be called after `compile()` and before the first `step()` if
