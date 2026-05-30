@@ -43,9 +43,15 @@ pub struct TransientState {
     pub inductor_currents: Vec<f64>,
     /// Per-inductor current from two steps ago — Gear-2 history term.
     pub prev_inductor_currents: Vec<f64>,
+    /// Per-inductor current from THREE steps ago — for LTE estimation.
+    pub prev2_inductor_currents: Vec<f64>,
     /// Previous node voltages — read by the predictor warm-start to
     /// extrapolate `n+1` from `n` and `n-1`.
     pub prev_node_volts: Vec<f64>,
+    /// Node voltages from two steps ago — for LTE estimation.
+    pub prev2_node_volts: Vec<f64>,
+    /// Per-capacitor voltage from three steps ago — for LTE estimation.
+    pub prev2_cap_volts: Vec<f64>,
     /// Junction-cap voltages, layout `[Q0_Vbe, Q0_Vbc, Q1_Vbe, Q1_Vbc, …]`.
     pub tj_cap_volts: Vec<f64>,
     /// Per-voltage-source branch current.  Indexed by VS order in
@@ -82,10 +88,13 @@ impl TransientState {
         Self {
             node_volts: vec![0.0; c.n],
             prev_node_volts: vec![0.0; c.n],
+            prev2_node_volts: vec![0.0; c.n],
             cap_volts: cap_volts.clone(),
-            prev_cap_volts: cap_volts,
+            prev_cap_volts: cap_volts.clone(),
+            prev2_cap_volts: cap_volts,
             inductor_currents: vec![0.0; c.inductor_count],
             prev_inductor_currents: vec![0.0; c.inductor_count],
+            prev2_inductor_currents: vec![0.0; c.inductor_count],
             tj_cap_volts: vec![0.0; c.transistor_count * 2],
             voltage_source_currents: vec![0.0; c.m],
             relay_active: vec![false; c.relay_count],
@@ -113,6 +122,8 @@ pub struct StepConfig {
     pub dt: f64,
     /// Integration method: Backward Euler or BDF-2.
     pub gear: Gear,
+    /// If true, calculate Local Truncation Error (LTE).
+    pub estimate_lte: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,11 +136,25 @@ impl StepConfig {
     /// Convenience constructor matching the most common transient setup:
     /// BDF-2 integration with the caller's dt.
     pub fn bdf2(dt: f64) -> Self {
-        Self { dt, gear: Gear::Bdf2 }
+        Self { dt, gear: Gear::Bdf2, estimate_lte: false }
     }
     pub fn be(dt: f64) -> Self {
-        Self { dt, gear: Gear::Be }
+        Self { dt, gear: Gear::Be, estimate_lte: false }
     }
+    pub fn with_lte(mut self) -> Self {
+        self.estimate_lte = true;
+        self
+    }
+}
+
+/// LTE estimation result.
+#[derive(Debug, Clone, Copy)]
+pub struct StepResult {
+    /// Number of Newton iterations performed.
+    pub iters: usize,
+    /// Estimated Local Truncation Error (max across all state variables).
+    /// Only populated if `estimate_lte` was true.
+    pub lte: Option<f64>,
 }
 
 const GMIN: f64 = 1e-9;
@@ -164,95 +189,25 @@ pub enum DcIssue {
     DidNotConverge,
 }
 
-/// Solve the DC operating point of the circuit.
-///
-/// Capacitors are treated as open circuits and inductors as short circuits.
-/// Returns the number of Newton iterations required to reach convergence.
-pub fn solve_dc(
+fn solve_dc_internal(
     c: &mut CompiledNetlist,
     state: &mut TransientState,
+    gmin: f64,
+    est: &mut [f64],
 ) -> Result<usize, DcIssue> {
     let size = c.size;
     let n = c.n;
 
-    // Largest |V| across voltage sources — used for transistor warm-start
-    // to pick a sane initial collector voltage.
-    let max_vcc = c
-        .voltage_source_values
-        .iter()
-        .map(|v| v.abs())
-        .fold(5.0_f64, f64::max);
-
-    // ── Build the DC base matrix + RHS ─────────────────────────────────
-    // Static stamps (resistors + V-source incidence) are reused as-is.
-    // Caps are skipped (open circuit).  Inductor branch-row coefficient is
-    // zero — the incidence stamps already enforce V_a = V_b, which is the
-    // short-circuit condition.  gmin diagonals keep the system invertible
-    // for isolated nodes.
-    c.base_matrix.fill(0.0);
-    c.base_rhs.fill(0.0);
-
-    let stamps = &c.static_stamps;
-    let mut k = 0;
-    while k < stamps.len() {
-        let r = stamps[k] as usize;
-        let col = stamps[k + 1] as usize;
-        let v = stamps[k + 2];
-        c.base_matrix[r * size + col] += v;
-        k += 3;
-    }
-    for &g_idx in &c.gmin_indices {
-        c.base_matrix[g_idx as usize] += GMIN;
-    }
-    for (idx, &row) in c.voltage_source_branch_rows.iter().enumerate() {
-        c.base_rhs[row as usize] = c.voltage_source_values[idx];
-    }
-    // Inductor branch rows: keep just the incidence terms (already in
-    // static_stamps).  No L/dt coefficient → V_a − V_b = 0 (short).
-
-    // ── Warm-start est buffer ──────────────────────────────────────────
-    let mut est = vec![0.0; size];
-    for ti in 0..c.transistor_count {
-        let el_idx = c.transistor_indices[ti];
-        let polarity = match &c.elements[el_idx] {
-            Element::Transistor { params, .. } => params.polarity,
-            _ => unreachable!(),
-        };
-        let bi = c.transistor_node_indices[ti * 3];
-        let ci_ = c.transistor_node_indices[ti * 3 + 1];
-        let ei = c.transistor_node_indices[ti * 3 + 2];
-        match polarity {
-            crate::types::Polarity::Npn => {
-                if ei >= 0 { est[ei as usize] = 0.0; }
-                if bi >= 0 { est[bi as usize] = 0.6; }
-                if ci_ >= 0 { est[ci_ as usize] = max_vcc * 0.5; }
-            }
-            crate::types::Polarity::Pnp => {
-                if ei >= 0 { est[ei as usize] = max_vcc; }
-                if bi >= 0 { est[bi as usize] = max_vcc * 0.9; }
-                if ci_ >= 0 { est[ci_ as usize] = max_vcc * 0.5; }
-            }
-        }
-    }
-
-    // ── DC Newton iteration ────────────────────────────────────────────
-    // Matches TS dc.ts: fixed iteration count, no step-limit clamp, no
-    // damping — full Newton step every iteration.  The transistor
-    // warm-start above gets us close enough that Newton converges
-    // quickly; the lack of damping is intentional, not an oversight.
-    //
-    // 15 iters for transistor-bearing nets, 10 for diode-only, 5 for
-    // relay-only (matches TS's relayIterations=5), 1 for purely linear.
-    // (Mirrors TS's `transistorIterations`/`diodeIterations`/`relayIterations`.)
     let dc_iter_budget = if c.transistor_count > 0 {
-        15
+        100
     } else if c.diode_count > 0 {
-        10
+        50
     } else if c.relay_count > 0 {
-        5
+        20
     } else {
         1
     };
+
     let mut actual_iters = 0;
     let mut solved_at_least_once = false;
 
@@ -260,6 +215,10 @@ pub fn solve_dc(
         actual_iters = iteration + 1;
 
         c.matrix.copy_from_slice(&c.base_matrix);
+        // Apply custom gmin
+        for &g_idx in &c.gmin_indices {
+            c.matrix[g_idx as usize] += gmin;
+        }
         c.rhs.copy_from_slice(&c.base_rhs);
 
         // Stamp transistors (DC mode — no prev_volts → no pnjlim).
@@ -304,13 +263,6 @@ pub fn solve_dc(
             }
         }
 
-        // Stamp relays at the de-energised state.  TS also
-        // iterates the relay state machine during DC (up to 5 outer
-        // iters), so a circuit whose steady-state current trips a relay
-        // at power-on would already be in the correct rest state.  Here
-        // we only stamp the rest state; relays energise during transient
-        // as usual.  For now this matches our kit projects (none of which
-        // are designed to power up with an already-active relay).
         stamp_relays(&mut c.matrix, size, c.relay_count, &c.relay_indices, &c.relay_node_indices, &c.elements, &state.relay_active);
 
         // Solve (sparse with dense fallback).
@@ -320,6 +272,10 @@ pub fn solve_dc(
         } else {
             // Re-stamp dense — sparse mutated matrix.
             c.matrix.copy_from_slice(&c.base_matrix);
+            // Apply custom gmin
+            for &g_idx in &c.gmin_indices {
+                c.matrix[g_idx as usize] += gmin;
+            }
             for ti in 0..c.transistor_count {
                 let el_idx = c.transistor_indices[ti];
                 let q = match &c.elements[el_idx] {
@@ -360,7 +316,6 @@ pub fn solve_dc(
                     c.matrix[(ki as usize) * size + (ai as usize)] -= s.gd;
                 }
             }
-            // Relays in DC dense fallback — same call as the sparse path.
             stamp_relays(&mut c.matrix, size, c.relay_count, &c.relay_indices, &c.relay_node_indices, &c.elements, &state.relay_active);
             match solve_linear_system(&mut c.matrix, &mut c.rhs, size) {
                 Some(x) => { c.rhs.copy_from_slice(&x); true }
@@ -372,36 +327,142 @@ pub fn solve_dc(
         }
         solved_at_least_once = true;
 
-        // Full Newton step — copy solution into est, no damping/clamp.
-        // This matches TS dc.ts exactly.  We do however check for NaN
-        // here: if the solve produced non-finite values (singular-near-
-        // singular matrix that still produced an LU answer but with
-        // numerical overflow), bail out rather than commit NaN.  Without
-        // this guard, NaN slides into state.node_volts and every
-        // subsequent transient step warm-starts from NaN, looping the
-        // worklet's failure recovery path forever.
+        let mut max_err = 0.0;
         let mut saw_nan_dc = false;
         for i in 0..size {
-            est[i] = c.rhs[i];
+            let old_v = est[i];
+            let new_v = c.rhs[i];
+            let err = (new_v - old_v).abs() / (1.0 + new_v.abs().max(old_v.abs()));
+            if err > max_err { max_err = err; }
+            est[i] = new_v;
             if !est[i].is_finite() { saw_nan_dc = true; }
         }
         if saw_nan_dc {
             return Err(DcIssue::DidNotConverge);
         }
 
-        // Iterate the relay state machine at DC too — TS does this with
-        // up to 5 outer iters (relayIterations).  We fold it into the
-        // inner Newton loop: each subsequent iter's stamp_relays will
-        // pick up the new state and re-solve.  Linear circuits with
-        // relays converge in 1–3 iters; we cap at dc_iter_budget=5.
+        if iteration > 0 && max_err < 1e-3 {
+            return Ok(actual_iters);
+        }
+        if iteration == 0 && c.transistor_count == 0 && c.diode_count == 0 && c.relay_count == 0 {
+            return Ok(actual_iters);
+        }
+
         update_relay_states(
             &mut state.relay_active, c.relay_count, &c.relay_indices,
-            &c.relay_node_indices, &c.elements, &est,
+            &c.relay_node_indices, &c.elements, est,
         );
     }
 
-    if !solved_at_least_once {
-        return Err(DcIssue::DidNotConverge);
+    if solved_at_least_once {
+        Err(DcIssue::DidNotConverge)
+    } else {
+        Err(DcIssue::SingularMatrix)
+    }
+}
+
+/// Solve the DC operating point of the circuit.
+///
+/// Capacitors are treated as open circuits and inductors as short circuits.
+/// Returns the number of Newton iterations required to reach convergence.
+pub fn solve_dc(
+    c: &mut CompiledNetlist,
+    state: &mut TransientState,
+) -> Result<usize, DcIssue> {
+    let size = c.size;
+    let n = c.n;
+
+    // Largest |V| across voltage sources — used for transistor warm-start
+    // to pick a sane initial collector voltage.
+    let max_vcc = c
+        .voltage_source_values
+        .iter()
+        .map(|v| v.abs())
+        .fold(5.0_f64, f64::max);
+
+    // ── Build the DC base matrix + RHS ─────────────────────────────────
+    // Static stamps (resistors + V-source incidence) are reused as-is.
+    // Caps are skipped (open circuit).  Inductor branch-row coefficient is
+    // zero — the incidence stamps already enforce V_a = V_b, which is the
+    // short-circuit condition.  gmin diagonals keep the system invertible
+    // for isolated nodes.
+    c.base_matrix.fill(0.0);
+    c.base_rhs.fill(0.0);
+
+    let stamps = &c.static_stamps;
+    let mut k = 0;
+    while k < stamps.len() {
+        let r = stamps[k] as usize;
+        let col = stamps[k + 1] as usize;
+        let v = stamps[k + 2];
+        c.base_matrix[r * size + col] += v;
+        k += 3;
+    }
+    // GMIN diagonal entries are handled inside solve_dc_internal
+    for (idx, &row) in c.voltage_source_branch_rows.iter().enumerate() {
+        c.base_rhs[row as usize] = c.voltage_source_values[idx];
+    }
+    // Inductor branch rows: keep just the incidence terms (already in
+    // static_stamps).  No L/dt coefficient → V_a − V_b = 0 (short).
+
+    // ── Warm-start est buffer ──────────────────────────────────────────
+    let mut est = vec![0.0; size];
+
+    // Warm start for BJTs
+    for ti in 0..c.transistor_count {
+        let el_idx = c.transistor_indices[ti];
+        let polarity = match &c.elements[el_idx] {
+            Element::Transistor { params, .. } => params.polarity,
+            _ => unreachable!(),
+        };
+        let bi = c.transistor_node_indices[ti * 3];
+        let ci_ = c.transistor_node_indices[ti * 3 + 1];
+        let ei = c.transistor_node_indices[ti * 3 + 2];
+        match polarity {
+            crate::types::Polarity::Npn => {
+                if ei >= 0 { est[ei as usize] = 0.0; }
+                if bi >= 0 { est[bi as usize] = 0.6; }
+                if ci_ >= 0 { est[ci_ as usize] = max_vcc * 0.5; }
+            }
+            crate::types::Polarity::Pnp => {
+                if ei >= 0 { est[ei as usize] = max_vcc; }
+                if bi >= 0 { est[bi as usize] = max_vcc * 0.9; }
+                if ci_ >= 0 { est[ci_ as usize] = max_vcc * 0.5; }
+            }
+        }
+    }
+
+    let mut actual_iters = 0;
+
+    // ── DC Newton iteration ────────────────────────────────────────────
+    // Attempt standard DC solve. If it fails to converge, we fall back
+    // to Gmin stepping.
+    match solve_dc_internal(c, state, GMIN, &mut est) {
+        Ok(iters) => {
+            actual_iters = iters;
+        }
+        Err(_) => {
+            // Gmin stepping: Start with a large GMIN to force convergence,
+            // then exponentially reduce it back to the target GMIN.
+            let mut gmin_current = 1e-2;
+            let gmin_target = GMIN;
+            let steps = 10;
+            let factor = (gmin_target / gmin_current).powf(1.0 / steps as f64);
+
+            for _ in 0..=steps {
+                actual_iters += solve_dc_internal(c, state, gmin_current, &mut est)
+                    .map_err(|e| {
+                        match e {
+                            DcIssue::SingularMatrix => DcIssue::SingularMatrix,
+                            DcIssue::DidNotConverge => DcIssue::DidNotConverge,
+                        }
+                    })?;
+                gmin_current *= factor;
+                if gmin_current < gmin_target {
+                    gmin_current = gmin_target;
+                }
+            }
+        }
     }
 
     // ── Commit DC solution into state ──────────────────────────────────
@@ -458,7 +519,7 @@ pub fn step(
     state: &mut TransientState,
     dt: f64,
 ) -> Result<usize, StepIssue> {
-    step_with_config(c, state, StepConfig::be(dt))
+    step_with_config(c, state, StepConfig::be(dt)).map(|r| r.iters)
 }
 
 /// Advances the simulation by one timestep using the specified configuration.
@@ -466,7 +527,7 @@ pub fn step_with_config(
     c: &mut CompiledNetlist,
     state: &mut TransientState,
     config: StepConfig,
-) -> Result<usize, StepIssue> {
+) -> Result<StepResult, StepIssue> {
     let dt = config.dt;
     if dt <= 0.0 || !dt.is_finite() {
         return Err(StepIssue::BadTimestep);
@@ -474,6 +535,14 @@ pub fn step_with_config(
     let dt_inv = 1.0 / dt;
     let size = c.size;
     let n = c.n;
+
+    // Capture state BEFORE commitment for LTE estimation if requested.
+    // We need state_{n-1} and state_{n-2} to compare with the new state_{n}.
+    // At this point:
+    // state.node_volts is x_{n-1}
+    // state.prev_node_volts is x_{n-2}
+    // state.prev2_node_volts is x_{n-3}
+    
     let use_gear2 = config.gear == Gear::Bdf2 && state.gear2_ready;
     let can_predict = state.gear2_ready && state.prev_dt > 0.0;
     let dt_ratio = if can_predict { (dt / state.prev_dt).min(4.0) } else { 0.0 };
@@ -934,9 +1003,14 @@ pub fn step_with_config(
     // BEFORE overwriting state with the new step.  Use mem::swap to avoid
     // allocations — the old prev_* contents are stale anyway and will be
     // overwritten with the new "current" values on the next step.
-    std::mem::swap(&mut state.node_volts, &mut state.prev_node_volts);
-    std::mem::swap(&mut state.cap_volts, &mut state.prev_cap_volts);
-    std::mem::swap(&mut state.inductor_currents, &mut state.prev_inductor_currents);
+    state.prev2_node_volts.copy_from_slice(&state.prev_node_volts);
+    state.prev_node_volts.copy_from_slice(&state.node_volts);
+
+    state.prev2_cap_volts.copy_from_slice(&state.prev_cap_volts);
+    state.prev_cap_volts.copy_from_slice(&state.cap_volts);
+
+    state.prev2_inductor_currents.copy_from_slice(&state.prev_inductor_currents);
+    state.prev_inductor_currents.copy_from_slice(&state.inductor_currents);
 
     state.node_volts.copy_from_slice(&est[..n]);
 
@@ -971,11 +1045,39 @@ pub fn step_with_config(
         state.tj_cap_volts[2 * ti + 1] = vb - vc;
     }
 
+    let gear2_already_ready = state.gear2_ready;
+
     // Mark history as populated so the NEXT step can use BDF-2 + predictor.
     state.gear2_ready = true;
     state.prev_dt = dt;
 
-    Ok(actual_iters)
+    let mut lte = None;
+    if config.estimate_lte && gear2_already_ready {
+        // Simple LTE estimation using divided differences.
+        // At this point, state.node_volts is the NEW solution x_n.
+        // state.prev_node_volts is x_{n-1}.
+        // state.prev2_node_volts is x_{n-2}.
+        
+        let mut max_lte = 0.0;
+        for i in 0..n {
+            let xn = state.node_volts[i];
+            let xn1 = state.prev_node_volts[i];
+            let xn2 = state.prev2_node_volts[i];
+            
+            let d2x = (xn - 2.0 * xn1 + xn2).abs(); // approx dt^2 * |x''|
+            let err = if use_gear2 {
+                // BDF-2 LTE is O(dt^3), usually smaller. 
+                // Very rough approx:
+                0.22 * d2x // Simplified
+            } else {
+                0.5 * d2x
+            };
+            if err > max_lte { max_lte = err; }
+        }
+        lte = Some(max_lte);
+    }
+
+    Ok(StepResult { iters: actual_iters, lte })
 }
 
 /// Stamp a two-node resistive conductance into the matrix only.  Skips
@@ -1784,5 +1886,51 @@ mod tests {
 
         // Verify we can now step normally.
         step(&mut compiled, &mut state, 1e-6).expect("step after DC reseed must succeed");
+    }
+
+    /// Verify LTE estimation detects changes in state.
+    #[test]
+    fn lte_estimation_rc() {
+        use crate::compile::compile_netlist;
+        let mut nl = Netlist::new(0);
+        nl.push(Element::VoltageSource {
+            id: "V1".into(), positive_node: 1, negative_node: 0, voltage: 5.0,
+        });
+        nl.push(Element::Resistor {
+            id: "R1".into(), a: 1, b: 2, resistance_ohms: 1_000.0,
+        });
+        nl.push(Element::Capacitor {
+            id: "C1".into(), a: 2, b: 0, capacitance_farads: 1e-6, initial_voltage: 0.0,
+        });
+        let mut compiled = compile_netlist(&nl).unwrap();
+        let mut state = TransientState::new(&compiled);
+
+        // Step 1: RC charging from 0V. High d2x expected.
+        let r1 = step_with_config(&mut compiled, &mut state, StepConfig::be(1e-4).with_lte()).unwrap();
+        // first step has no x_{n-2}, so LTE should be None or 0 (depending on implementation detail, 
+        // currently it returns Some(0.0) if gear2_ready is false, or None if I check gear2_ready).
+        // Actually I checked `state.gear2_ready` in the code.
+        assert!(r1.lte.is_none());
+
+        // Step 2: Now we have x_n, x_{n-1}. 
+        let r2 = step_with_config(&mut compiled, &mut state, StepConfig::be(1e-4).with_lte()).unwrap();
+        // Step 1: x_n is ~0.45, x_{n-1} is 0.0, x_{n-2} is 0.0. d2x = |0.45 - 0 + 0| = 0.45. err = 0.225.
+        // Step 2: x_n is ~0.82, x_{n-1} is 0.45, x_{n-2} is 0.0. d2x = |0.82 - 0.9 + 0| = 0.08. err = 0.04.
+        assert!(r2.lte.is_some());
+        let lte2 = r2.lte.unwrap();
+        
+        // Step 3: Now we have full history.
+        let r3 = step_with_config(&mut compiled, &mut state, StepConfig::be(1e-4).with_lte()).unwrap();
+        assert!(r3.lte.is_some());
+        let lte3 = r3.lte.unwrap();
+
+        // Step several more times. As capacitor charges, d2x should decrease.
+        let mut last_lte = lte3;
+        for _ in 0..10 {
+            let r = step_with_config(&mut compiled, &mut state, StepConfig::be(1e-4).with_lte()).unwrap();
+            let current_lte = r.lte.unwrap();
+            assert!(current_lte <= last_lte * 1.01, "LTE should decrease (or stay similar) as RC settles: {} -> {}", last_lte, current_lte);
+            last_lte = current_lte;
+        }
     }
 }

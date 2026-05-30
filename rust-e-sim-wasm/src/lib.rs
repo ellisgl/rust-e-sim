@@ -301,6 +301,8 @@ pub struct StepResult {
     /// On failure: 1 = singular matrix, 2 = Newton did not converge, 3 = bad dt.
     /// On success: 0.
     pub issue: u32,
+    /// Estimated Local Truncation Error (LTE).
+    pub lte: f64,
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -455,24 +457,24 @@ impl Simulator {
     pub fn step_with_gear(&mut self, dt: f64, gear: u8) -> StepResult {
         let c = match self.compiled.as_mut() {
             Some(c) => c,
-            None => return StepResult { ok: false, iters: 0, issue: 3 },
+            None => return StepResult { ok: false, iters: 0, issue: 3, lte: 0.0 },
         };
         let s = match self.state.as_mut() {
             Some(s) => s,
-            None => return StepResult { ok: false, iters: 0, issue: 3 },
+            None => return StepResult { ok: false, iters: 0, issue: 3, lte: 0.0 },
         };
         let cfg = match gear {
             2 => rust_e_sim_core::transient::StepConfig::bdf2(dt),
             _ => rust_e_sim_core::transient::StepConfig::be(dt),
-        };
+        }.with_lte();
         match rust_e_sim_core::transient::step_with_config(c, s, cfg) {
-            Ok(iters) => StepResult { ok: true, iters: iters as u32, issue: 0 },
+            Ok(r) => StepResult { ok: true, iters: r.iters as u32, issue: 0, lte: r.lte.unwrap_or(0.0) },
             Err(rust_e_sim_core::transient::StepIssue::SingularMatrix) =>
-                StepResult { ok: false, iters: 0, issue: 1 },
+                StepResult { ok: false, iters: 0, issue: 1, lte: 0.0 },
             Err(rust_e_sim_core::transient::StepIssue::NewtonDidNotConverge) =>
-                StepResult { ok: false, iters: 0, issue: 2 },
+                StepResult { ok: false, iters: 0, issue: 2, lte: 0.0 },
             Err(rust_e_sim_core::transient::StepIssue::BadTimestep) =>
-                StepResult { ok: false, iters: 0, issue: 3 },
+                StepResult { ok: false, iters: 0, issue: 3, lte: 0.0 },
         }
     }
 
@@ -524,7 +526,7 @@ impl Simulator {
             _ => rust_e_sim_core::transient::StepConfig::be(dt),
         };
         match rust_e_sim_core::transient::step_with_config(c, s, cfg) {
-            Ok(iters) => 1u32 | ((iters as u32 & 0x00FF_FFFF) << 8),
+            Ok(r) => 1u32 | ((r.iters as u32 & 0x00FF_FFFF) << 8),
             Err(rust_e_sim_core::transient::StepIssue::SingularMatrix)       => 1u32 << 1,
             Err(rust_e_sim_core::transient::StepIssue::NewtonDidNotConverge) => 2u32 << 1,
             Err(rust_e_sim_core::transient::StepIssue::BadTimestep)          => 3u32 << 1,
