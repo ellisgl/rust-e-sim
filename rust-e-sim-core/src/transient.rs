@@ -195,6 +195,7 @@ fn solve_dc_internal_with_limiting(
     gmin: f64,
     est: &mut [f64],
     prev_est: &mut [f64],
+    damp: f64,
 ) -> Result<usize, DcIssue> {
     let size = c.size;
 
@@ -331,6 +332,14 @@ fn solve_dc_internal_with_limiting(
 
         prev_est.copy_from_slice(est);
 
+        // Under-relaxation (damping).  A full Newton step (damp = 1.0) can
+        // enter a 2-cycle limit cycle near an oscillator's unstable
+        // equilibrium — the feedback node overshoots, the companion currents
+        // flip, and the iterate ping-pongs forever without converging.
+        // Taking a fractional step, est = old + damp·(new − old), breaks the
+        // cycle.  Callers pass damp = 1.0 for the normal fast path and a
+        // smaller value (≈0.3) during source stepping where limit cycles
+        // appear.
         let mut max_err = 0.0;
         let mut saw_nan_dc = false;
         for i in 0..size {
@@ -338,7 +347,7 @@ fn solve_dc_internal_with_limiting(
             let new_v = c.rhs[i];
             let err = (new_v - old_v).abs() / (1.0 + new_v.abs().max(old_v.abs()));
             if err > max_err { max_err = err; }
-            est[i] = new_v;
+            est[i] = if damp >= 1.0 { new_v } else { old_v + damp * (new_v - old_v) };
             if !est[i].is_finite() { saw_nan_dc = true; }
         }
         if saw_nan_dc {
@@ -611,34 +620,101 @@ pub fn solve_dc(
     let mut actual_iters = 0;
 
     // ── DC Newton iteration ────────────────────────────────────────────
-    // Attempt standard DC solve. If it fails to converge, we fall back
-    // to Gmin stepping.
+    // Three escalating strategies:
+    //   1. Direct Newton (no limiting)        — fast path, most circuits.
+    //   2. Gmin stepping                      — diodes / mild nonlinearity.
+    //   3. Source stepping + damping          — oscillators whose DC
+    //                                            equilibrium is unstable
+    //                                            (relaxation / LC), which
+    //                                            send plain Newton into a
+    //                                            limit cycle even with gmin.
     let mut prev_est = est.clone();
     match solve_dc_internal(c, state, GMIN, &mut est) {
         Ok(iters) => {
             actual_iters = iters;
         }
         Err(_) => {
-            // Gmin stepping: Start with a large GMIN to force convergence,
-            // then exponentially reduce it back to the target GMIN.
-            est.copy_from_slice(&prev_est);
-            let mut gmin_current = 1e-2;
+            // ── Strategy 2: Gmin stepping ──────────────────────────────
+            // Start with a large GMIN to force convergence, then
+            // exponentially reduce it back to the target GMIN.  Runs on a
+            // scratch copy so a late failure doesn't corrupt `est` before
+            // strategy 3 gets a clean start.
+            const GMIN_START: f64 = 1e-2;
+            const GMIN_STEPS: usize = 10;
             let gmin_target = GMIN;
-            let steps = 10;
-            let factor = (gmin_target / gmin_current).powf(1.0 / steps as f64);
+            let factor = (gmin_target / GMIN_START).powf(1.0 / GMIN_STEPS as f64);
 
-            for _ in 0..=steps {
-                let iters = solve_dc_internal_with_limiting(c, state, gmin_current, &mut est, &mut prev_est)
-                    .map_err(|e| {
-                        match e {
-                            DcIssue::SingularMatrix => DcIssue::SingularMatrix,
-                            DcIssue::DidNotConverge => DcIssue::DidNotConverge,
-                        }
-                    })?;
-                actual_iters += iters;
+            let mut est_gmin = est.clone();
+            let mut prev_gmin = prev_est.clone();
+            let mut gmin_iters = 0;
+            let mut gmin_current = GMIN_START;
+            let mut gmin_ok = true;
+            for _ in 0..=GMIN_STEPS {
+                match solve_dc_internal_with_limiting(
+                    c, state, gmin_current, &mut est_gmin, &mut prev_gmin, 1.0,
+                ) {
+                    Ok(it) => gmin_iters += it,
+                    Err(_) => { gmin_ok = false; break; }
+                }
                 gmin_current *= factor;
                 if gmin_current < gmin_target {
                     gmin_current = gmin_target;
+                }
+            }
+
+            if gmin_ok {
+                est.copy_from_slice(&est_gmin);
+                actual_iters += gmin_iters;
+            } else {
+                // ── Strategy 3: Source stepping (supply ramping) ───────
+                // Ramp every independent source from 0 to its full value in
+                // many small increments, re-solving at each and carrying the
+                // solution forward as the warm start.  Each increment nudges
+                // the operating point only slightly, keeping Newton inside
+                // its convergence basin.  Under-relaxation (DAMP) breaks the
+                // 2-cycle limit cycle that appears near an oscillator's
+                // Hopf point, where the equilibrium turns unstable.
+                //
+                // SRC_STEPS=100 / DAMP=0.3 converge every kit oscillator
+                // tested (P18 siren, P45 code oscillator, metronome).  These
+                // are deliberately conservative — this path only runs once
+                // at configure time after the two faster strategies fail,
+                // so the extra iterations don't affect steady-state cost.
+                const SRC_STEPS: usize = 100;
+                const SRC_DAMP: f64 = 0.3;
+
+                // Snapshot the full source drive (already written into
+                // base_rhs at each voltage-source branch row).
+                let saved: Vec<(usize, f64)> = c.voltage_source_branch_rows.iter()
+                    .map(|&row| (row as usize, c.base_rhs[row as usize]))
+                    .collect();
+
+                // Cold start from zero: at zero drive the solution is ~0.
+                for v in est.iter_mut() { *v = 0.0; }
+                prev_est.copy_from_slice(&est);
+
+                let mut src_ok = true;
+                for si in 1..=SRC_STEPS {
+                    let scale = si as f64 / SRC_STEPS as f64;
+                    for &(row, val) in &saved {
+                        c.base_rhs[row] = scale * val;
+                    }
+                    match solve_dc_internal_with_limiting(
+                        c, state, GMIN, &mut est, &mut prev_est, SRC_DAMP,
+                    ) {
+                        Ok(it) => actual_iters += it,
+                        Err(_) => { src_ok = false; break; }
+                    }
+                }
+
+                // Restore the full source drive regardless of outcome so the
+                // committed matrix/RHS reflect the real circuit.
+                for &(row, val) in &saved {
+                    c.base_rhs[row] = val;
+                }
+
+                if !src_ok {
+                    return Err(DcIssue::DidNotConverge);
                 }
             }
         }
