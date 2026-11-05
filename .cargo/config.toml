@@ -1,0 +1,11 @@
+# WebAssembly SIMD (simd128) for all wasm32 builds, including `wasm-pack build`.
+#
+# Lets LLVM auto-vectorise the solver's dense loops (matrix copy/fill, damped
+# Newton update, convergence reductions) into 128-bit f64x2 ops.
+#
+# Requires a SIMD-capable engine: Chrome/Edge 91+, Firefox 89+, Safari 16.4+,
+# Node 16.4+.  An engine without SIMD will refuse to instantiate the module.
+# To produce a non-SIMD build, override with:
+#   RUSTFLAGS="" wasm-pack build rust-e-sim-wasm --release
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
