@@ -23,10 +23,10 @@ pub struct DiodeStamp {
 
 /// SPICE pnjlim — limits the per-iteration junction-voltage swing to prevent
 /// Newton divergence at large forward biases.  Identical algorithm to the
-/// one in `transistor.rs`.
-fn limit_v(vnew: f64, vold: f64, vt: f64, is: f64) -> f64 {
-    let sqrt_2 = std::f64::consts::SQRT_2;
-    let vcrit = vt * (vt / (sqrt_2 * is)).ln();
+/// one in `transistor.rs`; `vcrit = vt·ln(vt / (√2·Is))` is precomputed by
+/// [`DiodeModel`].
+#[inline]
+fn limit_v(vnew: f64, vold: f64, vt: f64, vcrit: f64) -> f64 {
     if vnew > vcrit && (vnew - vold).abs() > 2.0 * vt {
         if vold > 0.0 {
             let arg = 1.0 + (vnew - vold) / vt;
@@ -38,6 +38,80 @@ fn limit_v(vnew: f64, vold: f64, vt: f64, is: f64) -> f64 {
     vnew
 }
 
+/// A [`Diode`] with every parameter-only quantity (`n·Vt`, `vcrit`, the
+/// forward ceiling — two `ln` calls) precomputed.  Build once per device;
+/// `stamp` is then pure per-iterate work, bit-identical to
+/// [`compute_diode_stamp`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiodeModel {
+    vt_n: f64,
+    is: f64,
+    vcrit: f64,
+    vd_max: f64,
+    /// Zener `(bv, ibv)` when the device has a reverse breakdown.
+    zener: Option<(f64, f64)>,
+}
+
+impl DiodeModel {
+    pub fn new(diode: &Diode) -> Self {
+        let vt_n = diode.n * VT_300K;
+        let is = diode.is.max(1e-20);
+        Self {
+            vt_n,
+            is,
+            vcrit: vt_n * (vt_n / (std::f64::consts::SQRT_2 * is)).ln(),
+            // Hard forward ceiling: cap at the voltage where Id ≈ 1 A to
+            // prevent exp() overflow in DC mode where pnjlim isn't applied.
+            vd_max: (30.0 * vt_n).min(vt_n * (1.0 / is).ln()),
+            zener: diode.bv.map(|bv| (bv, diode.ibv.unwrap_or(1e-3))),
+        }
+    }
+
+    /// Compute the diode stamp for the current Newton iterate.  Arguments
+    /// as for [`compute_diode_stamp`].
+    pub fn stamp(
+        &self,
+        volts: &[f64],
+        ai: i32,
+        ki: i32,
+        prev_volts: Option<&[f64]>,
+    ) -> DiodeStamp {
+        let Self { vt_n, is, .. } = *self;
+        let va = if ai >= 0 { volts[ai as usize] } else { 0.0 };
+        let vc = if ki >= 0 { volts[ki as usize] } else { 0.0 };
+        let mut vd = va - vc;
+
+        if let Some(prev) = prev_volts {
+            // Transient: SPICE pnjlim keeps Newton steps tractable.
+            let pva = if ai >= 0 { prev[ai as usize] } else { 0.0 };
+            let pvc = if ki >= 0 { prev[ki as usize] } else { 0.0 };
+            vd = limit_v(vd, pva - pvc, vt_n, self.vcrit);
+        }
+        vd = vd.min(self.vd_max);
+
+        // ── Forward Shockley ────────────────────────────────────────────
+        let exp_f = (vd / vt_n).min(40.0).exp();
+        let id_fwd = is * (exp_f - 1.0);
+        let gd_fwd = is * exp_f / vt_n;
+
+        // ── Zener reverse breakdown ─────────────────────────────────────
+        let (id_bv, gd_bv) = if let Some((bv, ibv)) = self.zener {
+            // `arg` is positive when Vd < -Bv (device is in breakdown).
+            let arg = (-(vd + bv) / vt_n).min(40.0);
+            let exp_bv = arg.max(-40.0).exp();
+            (-ibv * exp_bv, ibv * exp_bv / vt_n)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let id = id_fwd + id_bv;
+        let gd = (gd_fwd + gd_bv).max(1e-12);
+        let ieq = id - gd * vd; // companion correction
+
+        DiodeStamp { gd, ieq }
+    }
+}
+
 /// Compute the diode stamp for the current Newton iterate.
 ///
 /// # Arguments
@@ -46,7 +120,10 @@ fn limit_v(vnew: f64, vold: f64, vt: f64, is: f64) -> f64 {
 /// * `ai`         — Compact anode index; `-1` if anode is grounded.
 /// * `ki`         — Compact cathode index; `-1` if cathode is grounded.
 /// * `prev_volts` — Previous-step compact voltages for SPICE pnjlim
-///                  (`None` in DC mode).
+///   (`None` in DC mode).
+///
+/// Convenience wrapper that rebuilds the [`DiodeModel`] on every call; hot
+/// loops should build the model once and call [`DiodeModel::stamp`].
 pub fn compute_diode_stamp(
     diode: &Diode,
     volts: &[f64],
@@ -54,46 +131,7 @@ pub fn compute_diode_stamp(
     ki: i32,
     prev_volts: Option<&[f64]>,
 ) -> DiodeStamp {
-    let va = if ai >= 0 { volts[ai as usize] } else { 0.0 };
-    let vc = if ki >= 0 { volts[ki as usize] } else { 0.0 };
-    let mut vd = va - vc;
-
-    let vt_n = diode.n * VT_300K;
-    let is = diode.is.max(1e-20);
-
-    if let Some(prev) = prev_volts {
-        // Transient: SPICE pnjlim keeps Newton steps tractable.
-        let pva = if ai >= 0 { prev[ai as usize] } else { 0.0 };
-        let pvc = if ki >= 0 { prev[ki as usize] } else { 0.0 };
-        vd = limit_v(vd, pva - pvc, vt_n, is);
-    }
-
-    // Hard forward ceiling: cap at the voltage where Id ≈ 1 A to prevent
-    // exp() overflow in DC mode where pnjlim isn't applied.
-    let vd_max = (30.0 * vt_n).min(vt_n * (1.0 / is).ln());
-    vd = vd.min(vd_max);
-
-    // ── Forward Shockley ────────────────────────────────────────────────
-    let exp_f = (vd / vt_n).min(40.0).exp();
-    let id_fwd = is * (exp_f - 1.0);
-    let gd_fwd = is * exp_f / vt_n;
-
-    // ── Zener reverse breakdown ─────────────────────────────────────────
-    let (id_bv, gd_bv) = if let Some(bv) = diode.bv {
-        let ibv = diode.ibv.unwrap_or(1e-3);
-        // `arg` is positive when Vd < -Bv (device is in breakdown).
-        let arg = (-(vd + bv) / vt_n).min(40.0);
-        let exp_bv = arg.max(-40.0).exp();
-        (-ibv * exp_bv, ibv * exp_bv / vt_n)
-    } else {
-        (0.0, 0.0)
-    };
-
-    let id = id_fwd + id_bv;
-    let gd = (gd_fwd + gd_bv).max(1e-12);
-    let ieq = id - gd * vd; // companion correction
-
-    DiodeStamp { gd, ieq }
+    DiodeModel::new(diode).stamp(volts, ai, ki, prev_volts)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────

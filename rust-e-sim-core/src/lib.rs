@@ -8,13 +8,13 @@
 //! ----------
 //! The simulator is built in layers:
 //! - `sparse`    — Linear algebra: symbolic and numeric sparse LU factorization,
-//!                 Minimum-Degree reordering for fill-in reduction.
+//!   Minimum-Degree reordering for fill-in reduction.
 //! - `linear`    — Fallback dense Gaussian elimination for singular systems.
 //! - `netlist`   — Circuit topology and element definitions.
 //! - `compile`   — Static analysis: converts a netlist into a fixed MNA structure
-//!                 with pre-computed stamps.
+//!   with pre-computed stamps.
 //! - `transient` — The main solver loop: Newton-Raphson iteration with Backward
-//!                 Euler and BDF-2 (Gear-2) integration.
+//!   Euler and BDF-2 (Gear-2) integration.
 //!
 //! Numerical Stability
 //! -------------------

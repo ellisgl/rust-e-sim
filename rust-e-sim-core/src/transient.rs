@@ -19,11 +19,11 @@
 //! (`pnjlim`) for nonlinear devices and `GMIN` regularisation.
 
 use crate::compile::CompiledNetlist;
-use crate::diode::compute_diode_stamp;
 use crate::linear::solve_linear_system;
 use crate::netlist::Element;
 use crate::sparse::{numeric_factor, sparse_solve_in_place};
-use crate::transistor::compute_transistor_stamp;
+use crate::diode::DiodeModel;
+use crate::transistor::TransistorModel;
 use serde::{Serialize, Deserialize};
 
 /// Mutable per-step solver state.
@@ -189,17 +189,178 @@ pub enum DcIssue {
     DidNotConverge,
 }
 
-fn solve_dc_internal_with_limiting(
-    c: &mut CompiledNetlist,
-    state: &mut TransientState,
-    gmin: f64,
-    est: &mut [f64],
-    prev_est: &mut [f64],
-    damp: f64,
-) -> Result<usize, DcIssue> {
-    let size = c.size;
+/// How nonlinear devices are linearised for one Newton assembly.
+#[derive(Clone, Copy)]
+struct StampMode<'a> {
+    /// Previous voltages for BJT pnjlim (`None` = no limiting).
+    bjt_prev: Option<&'a [f64]>,
+    /// Previous voltages for diode pnjlim (`None` = no limiting).
+    diode_prev: Option<&'a [f64]>,
+    /// Transient only: BJT junction/diffusion caps as BE companions,
+    /// `(tj_cap_volts, 1/dt)`.
+    junction_caps: Option<(&'a [f64], f64)>,
+}
 
-    let dc_iter_budget = if c.transistor_count > 0 {
+/// Read-only view of the device tables, split from the mutable scratch
+/// buffers so both can be borrowed from one `CompiledNetlist` at once.
+struct Devices<'a> {
+    size: usize,
+    n: usize,
+    elements: &'a [Element],
+    transistor_models: &'a [TransistorModel],
+    transistor_node_indices: &'a [i32],
+    diode_models: &'a [DiodeModel],
+    diode_node_indices: &'a [i32],
+    relay_indices: &'a [usize],
+    relay_node_indices: &'a [i32],
+}
+
+impl Devices<'_> {
+    /// Stamp every nonlinear / state-dependent device (BJTs + junction caps,
+    /// diodes, relays) on top of the base system already in `matrix`/`rhs`.
+    fn stamp(
+        &self,
+        matrix: &mut [f64],
+        rhs: &mut [f64],
+        est: &[f64],
+        relay_active: &[bool],
+        mode: StampMode<'_>,
+    ) {
+        let size = self.size;
+        let volts = &est[..self.n];
+
+        for (ti, (q, ix)) in self.transistor_models.iter()
+            .zip(self.transistor_node_indices.chunks_exact(3))
+            .enumerate()
+        {
+            let (bi, ci, ei) = (ix[0], ix[1], ix[2]);
+            // In transient mode the previous-step node voltages engage SPICE
+            // pnjlim, limiting how far Vbe can swing per step.  Without it
+            // Newton oversteps the BJT's narrow active region in one
+            // iteration and cap-stabilised transitions get short-circuited.
+            let s = q.stamp(volts, bi, ci, ei, mode.bjt_prev);
+
+            // BJT MNA stamps.  Sign conventions match transient.ts.
+            //   I_C = gm·Vbe + gmu·Vbc + iEqC
+            //   I_B = gpi·Vbe + gmu_b·Vbc + iEqB
+            //   (I_E by KCL.)
+            stamp_bjt(
+                matrix, rhs, size, bi, ci, ei,
+                s.gm, s.gmu, s.gpi, s.gmu_b,
+                s.i_eq_b, s.i_eq_c, s.i_eq_e,
+            );
+
+            // Junction + diffusion capacitance — REQUIRED for correct
+            // large-signal switching dynamics.  Without these stamps BJTs in
+            // blocking-oscillator circuits (metronome, siren) switch
+            // instantly, run at 10× the correct rate and produce ~20 dB
+            // lower speaker swing.  TS uses plain BE for these caps (not
+            // BDF-2); we match that here.
+            //
+            // C_BE = cje + tf · gm     (junction + forward diffusion)
+            // C_BC = cjc + tr · gmu_b  (junction + reverse diffusion)
+            if let Some((tj_cap_volts, dt_inv)) = mode.junction_caps {
+                let cbe_total = q.cje_farads + q.tf_seconds * s.gm;
+                let cbc_total = q.cjc_farads + q.tr_seconds * s.gmu_b;
+                if cbe_total > 0.0 {
+                    let g = cbe_total * dt_inv;
+                    stamp_two_node_cap(matrix, rhs, size, bi, ei, g, g * tj_cap_volts[2 * ti]);
+                }
+                if cbc_total > 0.0 {
+                    let g = cbc_total * dt_inv;
+                    stamp_two_node_cap(matrix, rhs, size, bi, ci, g, g * tj_cap_volts[2 * ti + 1]);
+                }
+            }
+        }
+
+        for (d, ix) in self.diode_models.iter().zip(self.diode_node_indices.chunks_exact(2)) {
+            let (ai, ki) = (ix[0], ix[1]);
+            let s = d.stamp(volts, ai, ki, mode.diode_prev);
+            // Y[a,a] += gd; Y[k,k] += gd; Y[a,k] -= gd; Y[k,a] -= gd
+            // rhs[a] -= ieq; rhs[k] += ieq
+            if ai >= 0 {
+                let ai = ai as usize;
+                matrix[ai * size + ai] += s.gd;
+                rhs[ai] -= s.ieq;
+            }
+            if ki >= 0 {
+                let ki = ki as usize;
+                matrix[ki * size + ki] += s.gd;
+                rhs[ki] += s.ieq;
+            }
+            if ai >= 0 && ki >= 0 {
+                matrix[(ai as usize) * size + (ki as usize)] -= s.gd;
+                matrix[(ki as usize) * size + (ai as usize)] -= s.gd;
+            }
+        }
+
+        // Relays: linear resistive stamps whose values depend on
+        // `relay_active`, which `update_relay_states` flips after each solve.
+        stamp_relays(
+            matrix, size, self.relay_indices, self.relay_node_indices,
+            self.elements, relay_active,
+        );
+    }
+}
+
+/// Assemble one Newton iteration from the base system and solve it.
+///
+/// Working matrix/RHS = base (+ `extra_gmin` on node diagonals, if any) +
+/// device stamps.  Tries the sparse LU first; if a pivot collapses, the
+/// system is re-assembled from scratch and solved with dense partial
+/// pivoting.  On `true` the solution is in `c.rhs`.
+fn assemble_and_solve(
+    c: &mut CompiledNetlist,
+    extra_gmin: Option<f64>,
+    est: &[f64],
+    relay_active: &[bool],
+    mode: StampMode<'_>,
+) -> bool {
+    let CompiledNetlist {
+        matrix, rhs, base_matrix, base_rhs, gmin_indices, sparse_pattern,
+        size, n, elements,
+        transistor_models, transistor_node_indices,
+        diode_models, diode_node_indices,
+        relay_indices, relay_node_indices,
+        ..
+    } = c;
+    let size = *size;
+    let devices = Devices {
+        size,
+        n: *n,
+        elements,
+        transistor_models,
+        transistor_node_indices,
+        diode_models,
+        diode_node_indices,
+        relay_indices,
+        relay_node_indices,
+    };
+    let assemble = |matrix: &mut [f64], rhs: &mut [f64]| {
+        matrix.copy_from_slice(base_matrix);
+        if let Some(g) = extra_gmin {
+            for &g_idx in gmin_indices.iter() {
+                matrix[g_idx as usize] += g;
+            }
+        }
+        rhs.copy_from_slice(base_rhs);
+        devices.stamp(matrix, rhs, est, relay_active, mode);
+    };
+
+    assemble(matrix, rhs);
+    if numeric_factor(matrix, size, sparse_pattern) {
+        sparse_solve_in_place(matrix, rhs, size, sparse_pattern);
+        return true;
+    }
+    // Rare singular-pivot fallback: the sparse factorisation clobbered the
+    // matrix, so rebuild BOTH matrix and RHS before the dense solve.
+    assemble(matrix, rhs);
+    solve_linear_system(matrix, rhs, size)
+}
+
+/// Per-circuit DC Newton iteration budget.
+fn dc_iter_budget(c: &CompiledNetlist) -> usize {
+    if c.transistor_count > 0 {
         100
     } else if c.diode_count > 0 {
         50
@@ -207,130 +368,38 @@ fn solve_dc_internal_with_limiting(
         20
     } else {
         1
-    };
+    }
+}
 
-    let mut actual_iters = 0;
-    let mut solved_at_least_once = false;
+/// One DC Newton solve at a fixed `gmin`.
+///
+/// With `prev_est = None` devices are linearised without pnjlim (the fast
+/// path).  With `Some(prev_est)` pnjlim limits each iterate against the
+/// previous one, and `damp` under-relaxes the update — used by the gmin-
+/// and source-stepping fallbacks.  Converges when the scaled max change
+/// drops below `tol`.
+fn dc_newton(
+    c: &mut CompiledNetlist,
+    state: &mut TransientState,
+    gmin: f64,
+    est: &mut [f64],
+    mut prev_est: Option<&mut [f64]>,
+    damp: f64,
+    tol: f64,
+) -> Result<usize, DcIssue> {
+    let size = c.size;
+    let linear = c.transistor_count == 0 && c.diode_count == 0 && c.relay_count == 0;
 
-    for iteration in 0..dc_iter_budget {
-        actual_iters += 1;
-
-        c.matrix.copy_from_slice(&c.base_matrix);
-        // Apply custom gmin
-        for &g_idx in &c.gmin_indices {
-            c.matrix[g_idx as usize] += gmin;
-        }
-        c.rhs.copy_from_slice(&c.base_rhs);
-
-        // Stamp transistors with limiting
-        for ti in 0..c.transistor_count {
-            let el_idx = c.transistor_indices[ti];
-            let q = match &c.elements[el_idx] {
-                Element::Transistor { params, .. } => params,
-                _ => unreachable!(),
-            };
-            let bi = c.transistor_node_indices[ti * 3];
-            let ci_ = c.transistor_node_indices[ti * 3 + 1];
-            let ei = c.transistor_node_indices[ti * 3 + 2];
-            // Use solve_dc_internal_with_limiting to pass prev_est for limiting
-            let s = compute_transistor_stamp(q, est, bi, ci_, ei, Some(prev_est));
-            stamp_bjt(
-                &mut c.matrix, &mut c.rhs, size, bi, ci_, ei,
-                s.gm, s.gmu, s.gpi, s.gmu_b,
-                s.i_eq_b, s.i_eq_c, s.i_eq_e,
-            );
-        }
-        for di in 0..c.diode_count {
-            let el_idx = c.diode_indices[di];
-            let d = match &c.elements[el_idx] {
-                Element::Diode { params, .. } => params,
-                _ => unreachable!(),
-            };
-            let ai = c.diode_node_indices[di * 2];
-            let ki = c.diode_node_indices[di * 2 + 1];
-            let s = compute_diode_stamp(d, est, ai, ki, Some(prev_est));
-            if ai >= 0 {
-                let ai = ai as usize;
-                c.matrix[ai * size + ai] += s.gd;
-                c.rhs[ai] -= s.ieq;
-            }
-            if ki >= 0 {
-                let ki = ki as usize;
-                c.matrix[ki * size + ki] += s.gd;
-                c.rhs[ki] += s.ieq;
-            }
-            if ai >= 0 && ki >= 0 {
-                c.matrix[(ai as usize) * size + (ki as usize)] -= s.gd;
-                c.matrix[(ki as usize) * size + (ai as usize)] -= s.gd;
-            }
-        }
-
-        stamp_relays(&mut c.matrix, size, c.relay_count, &c.relay_indices, &c.relay_node_indices, &c.elements, &state.relay_active);
-
-        // Solve (sparse with dense fallback).
-        let solved_ok = if numeric_factor(&mut c.matrix, size, &c.sparse_pattern) {
-            sparse_solve_in_place(&c.matrix, &mut c.rhs, size, &c.sparse_pattern);
-            true
-        } else {
-            // Re-stamp dense — sparse mutated matrix.
-            c.matrix.copy_from_slice(&c.base_matrix);
-            // Apply custom gmin
-            for &g_idx in &c.gmin_indices {
-                c.matrix[g_idx as usize] += gmin;
-            }
-            for ti in 0..c.transistor_count {
-                let el_idx = c.transistor_indices[ti];
-                let q = match &c.elements[el_idx] {
-                    Element::Transistor { params, .. } => params,
-                    _ => unreachable!(),
-                };
-                let bi = c.transistor_node_indices[ti * 3];
-                let ci_ = c.transistor_node_indices[ti * 3 + 1];
-                let ei = c.transistor_node_indices[ti * 3 + 2];
-                let s = compute_transistor_stamp(q, est, bi, ci_, ei, Some(prev_est));
-                stamp_bjt(
-                    &mut c.matrix, &mut c.rhs, size, bi, ci_, ei,
-                    s.gm, s.gmu, s.gpi, s.gmu_b,
-                    s.i_eq_b, s.i_eq_c, s.i_eq_e,
-                );
-            }
-            for di in 0..c.diode_count {
-                let el_idx = c.diode_indices[di];
-                let d = match &c.elements[el_idx] {
-                    Element::Diode { params, .. } => params,
-                    _ => unreachable!(),
-                };
-                let ai = c.diode_node_indices[di * 2];
-                let ki = c.diode_node_indices[di * 2 + 1];
-                let s = compute_diode_stamp(d, est, ai, ki, Some(prev_est));
-                if ai >= 0 {
-                    let ai = ai as usize;
-                    c.matrix[ai * size + ai] += s.gd;
-                    c.rhs[ai] -= s.ieq;
-                }
-                if ki >= 0 {
-                    let ki = ki as usize;
-                    c.matrix[ki * size + ki] += s.gd;
-                    c.rhs[ki] += s.ieq;
-                }
-                if ai >= 0 && ki >= 0 {
-                    c.matrix[(ai as usize) * size + (ki as usize)] -= s.gd;
-                    c.matrix[(ki as usize) * size + (ai as usize)] -= s.gd;
-                }
-            }
-            stamp_relays(&mut c.matrix, size, c.relay_count, &c.relay_indices, &c.relay_node_indices, &c.elements, &state.relay_active);
-            match solve_linear_system(&mut c.matrix, &mut c.rhs, size) {
-                Some(x) => { c.rhs.copy_from_slice(&x); true }
-                None => false,
-            }
-        };
-
-        if !solved_ok {
+    for iteration in 0..dc_iter_budget(c) {
+        let limit = prev_est.as_deref();
+        let mode = StampMode { bjt_prev: limit, diode_prev: limit, junction_caps: None };
+        if !assemble_and_solve(c, Some(gmin), est, &state.relay_active, mode) {
             return Err(DcIssue::SingularMatrix);
         }
-        solved_at_least_once = true;
 
-        prev_est.copy_from_slice(est);
+        if let Some(p) = prev_est.as_deref_mut() {
+            p.copy_from_slice(est);
+        }
 
         // Under-relaxation (damping).  A full Newton step (damp = 1.0) can
         // enter a 2-cycle limit cycle near an oscillator's unstable
@@ -338,212 +407,36 @@ fn solve_dc_internal_with_limiting(
         // flip, and the iterate ping-pongs forever without converging.
         // Taking a fractional step, est = old + damp·(new − old), breaks the
         // cycle.  Callers pass damp = 1.0 for the normal fast path and a
-        // smaller value (≈0.3) during source stepping where limit cycles
-        // appear.
+        // smaller value (≈0.3) during source stepping.
         let mut max_err = 0.0;
-        let mut saw_nan_dc = false;
-        for i in 0..size {
-            let old_v = est[i];
-            let new_v = c.rhs[i];
+        let mut saw_nan = false;
+        for (e, &new_v) in est.iter_mut().zip(&c.rhs[..size]) {
+            let old_v = *e;
             let err = (new_v - old_v).abs() / (1.0 + new_v.abs().max(old_v.abs()));
             if err > max_err { max_err = err; }
-            est[i] = if damp >= 1.0 { new_v } else { old_v + damp * (new_v - old_v) };
-            if !est[i].is_finite() { saw_nan_dc = true; }
+            *e = if damp >= 1.0 { new_v } else { old_v + damp * (new_v - old_v) };
+            if !e.is_finite() { saw_nan = true; }
         }
-        if saw_nan_dc {
+        if saw_nan {
             return Err(DcIssue::DidNotConverge);
         }
 
-        if iteration > 0 && max_err < 1e-6 {
-            return Ok(actual_iters);
+        if iteration > 0 && max_err < tol {
+            return Ok(iteration + 1);
         }
-        if iteration == 0 && c.transistor_count == 0 && c.diode_count == 0 && c.relay_count == 0 {
-            return Ok(actual_iters);
+        if iteration == 0 && linear {
+            return Ok(1);
         }
 
         update_relay_states(
-            &mut state.relay_active, c.relay_count, &c.relay_indices,
+            &mut state.relay_active, &c.relay_indices,
             &c.relay_node_indices, &c.elements, est,
         );
     }
 
-    if solved_at_least_once {
-        Err(DcIssue::DidNotConverge)
-    } else {
-        Err(DcIssue::SingularMatrix)
-    }
-}
-
-fn solve_dc_internal(
-    c: &mut CompiledNetlist,
-    state: &mut TransientState,
-    gmin: f64,
-    est: &mut [f64],
-) -> Result<usize, DcIssue> {
-    let size = c.size;
-    let n = c.n;
-
-    let dc_iter_budget = if c.transistor_count > 0 {
-        100
-    } else if c.diode_count > 0 {
-        50
-    } else if c.relay_count > 0 {
-        20
-    } else {
-        1
-    };
-
-    let mut solved_at_least_once = false;
-
-    let mut actual_iters = 0;
-    for iteration in 0..dc_iter_budget {
-        actual_iters += 1;
-
-        c.matrix.copy_from_slice(&c.base_matrix);
-        // Apply custom gmin
-        for &g_idx in &c.gmin_indices {
-            c.matrix[g_idx as usize] += gmin;
-        }
-        c.rhs.copy_from_slice(&c.base_rhs);
-
-        // Stamp transistors (DC mode — no prev_volts → no pnjlim).
-        for ti in 0..c.transistor_count {
-            let el_idx = c.transistor_indices[ti];
-            let q = match &c.elements[el_idx] {
-                Element::Transistor { params, .. } => params,
-                _ => unreachable!(),
-            };
-            let bi = c.transistor_node_indices[ti * 3];
-            let ci_ = c.transistor_node_indices[ti * 3 + 1];
-            let ei = c.transistor_node_indices[ti * 3 + 2];
-            let s = compute_transistor_stamp(q, &est[..n], bi, ci_, ei, None);
-            stamp_bjt(
-                &mut c.matrix, &mut c.rhs, size, bi, ci_, ei,
-                s.gm, s.gmu, s.gpi, s.gmu_b,
-                s.i_eq_b, s.i_eq_c, s.i_eq_e,
-            );
-        }
-        for di in 0..c.diode_count {
-            let el_idx = c.diode_indices[di];
-            let d = match &c.elements[el_idx] {
-                Element::Diode { params, .. } => params,
-                _ => unreachable!(),
-            };
-            let ai = c.diode_node_indices[di * 2];
-            let ki = c.diode_node_indices[di * 2 + 1];
-            let s = compute_diode_stamp(d, &est[..n], ai, ki, None);
-            if ai >= 0 {
-                let ai = ai as usize;
-                c.matrix[ai * size + ai] += s.gd;
-                c.rhs[ai] -= s.ieq;
-            }
-            if ki >= 0 {
-                let ki = ki as usize;
-                c.matrix[ki * size + ki] += s.gd;
-                c.rhs[ki] += s.ieq;
-            }
-            if ai >= 0 && ki >= 0 {
-                c.matrix[(ai as usize) * size + (ki as usize)] -= s.gd;
-                c.matrix[(ki as usize) * size + (ai as usize)] -= s.gd;
-            }
-        }
-
-        stamp_relays(&mut c.matrix, size, c.relay_count, &c.relay_indices, &c.relay_node_indices, &c.elements, &state.relay_active);
-
-        // Solve (sparse with dense fallback).
-        let solved_ok = if numeric_factor(&mut c.matrix, size, &c.sparse_pattern) {
-            sparse_solve_in_place(&c.matrix, &mut c.rhs, size, &c.sparse_pattern);
-            true
-        } else {
-            // Re-stamp dense — sparse mutated matrix.
-            c.matrix.copy_from_slice(&c.base_matrix);
-            // Apply custom gmin
-            for &g_idx in &c.gmin_indices {
-                c.matrix[g_idx as usize] += gmin;
-            }
-            for ti in 0..c.transistor_count {
-                let el_idx = c.transistor_indices[ti];
-                let q = match &c.elements[el_idx] {
-                    Element::Transistor { params, .. } => params,
-                    _ => unreachable!(),
-                };
-                let bi = c.transistor_node_indices[ti * 3];
-                let ci_ = c.transistor_node_indices[ti * 3 + 1];
-                let ei = c.transistor_node_indices[ti * 3 + 2];
-                let s = compute_transistor_stamp(q, &est[..n], bi, ci_, ei, None);
-                stamp_bjt(
-                    &mut c.matrix, &mut c.rhs, size, bi, ci_, ei,
-                    s.gm, s.gmu, s.gpi, s.gmu_b,
-                    s.i_eq_b, s.i_eq_c, s.i_eq_e,
-                );
-            }
-            for di in 0..c.diode_count {
-                let el_idx = c.diode_indices[di];
-                let d = match &c.elements[el_idx] {
-                    Element::Diode { params, .. } => params,
-                    _ => unreachable!(),
-                };
-                let ai = c.diode_node_indices[di * 2];
-                let ki = c.diode_node_indices[di * 2 + 1];
-                let s = compute_diode_stamp(d, &est[..n], ai, ki, None);
-                if ai >= 0 {
-                    let ai = ai as usize;
-                    c.matrix[ai * size + ai] += s.gd;
-                    c.rhs[ai] -= s.ieq;
-                }
-                if ki >= 0 {
-                    let ki = ki as usize;
-                    c.matrix[ki * size + ki] += s.gd;
-                    c.rhs[ki] += s.ieq;
-                }
-                if ai >= 0 && ki >= 0 {
-                    c.matrix[(ai as usize) * size + (ki as usize)] -= s.gd;
-                    c.matrix[(ki as usize) * size + (ai as usize)] -= s.gd;
-                }
-            }
-            stamp_relays(&mut c.matrix, size, c.relay_count, &c.relay_indices, &c.relay_node_indices, &c.elements, &state.relay_active);
-            match solve_linear_system(&mut c.matrix, &mut c.rhs, size) {
-                Some(x) => { c.rhs.copy_from_slice(&x); true }
-                None => false,
-            }
-        };
-        if !solved_ok {
-            return Err(DcIssue::SingularMatrix);
-        }
-        solved_at_least_once = true;
-
-        let mut max_err = 0.0;
-        let mut saw_nan_dc = false;
-        for i in 0..size {
-            let old_v = est[i];
-            let new_v = c.rhs[i];
-            let err = (new_v - old_v).abs() / (1.0 + new_v.abs().max(old_v.abs()));
-            if err > max_err { max_err = err; }
-            est[i] = new_v;
-            if !est[i].is_finite() { saw_nan_dc = true; }
-        }
-        if saw_nan_dc {
-            return Err(DcIssue::DidNotConverge);
-        }
-
-        if iteration > 0 && max_err < 1e-3 {
-            return Ok(actual_iters);
-        }
-        if iteration == 0 && c.transistor_count == 0 && c.diode_count == 0 && c.relay_count == 0 {
-            return Ok(actual_iters);
-        }
-
-        update_relay_states(
-            &mut state.relay_active, c.relay_count, &c.relay_indices,
-            &c.relay_node_indices, &c.elements, est,
-        );
-    }
-
-    if solved_at_least_once {
-        Err(DcIssue::DidNotConverge)
-    } else {
-        Err(DcIssue::SingularMatrix)
-    }
+    // Every iteration either solved or returned early, so reaching here
+    // means the budget ran out after at least one successful solve.
+    Err(DcIssue::DidNotConverge)
 }
 
 /// Solve the DC operating point of the circuit.
@@ -569,52 +462,28 @@ pub fn solve_dc(
     // Static stamps (resistors + V-source incidence) are reused as-is.
     // Caps are skipped (open circuit).  Inductor branch-row coefficient is
     // zero — the incidence stamps already enforce V_a = V_b, which is the
-    // short-circuit condition.  gmin diagonals keep the system invertible
-    // for isolated nodes.
-    c.base_matrix.fill(0.0);
+    // short-circuit condition.  gmin is added per Newton solve (it varies
+    // during gmin stepping).
+    c.base_matrix.copy_from_slice(&c.static_matrix);
     c.base_rhs.fill(0.0);
-
-    let stamps = &c.static_stamps;
-    let mut k = 0;
-    while k < stamps.len() {
-        let r = stamps[k] as usize;
-        let col = stamps[k + 1] as usize;
-        let v = stamps[k + 2];
-        c.base_matrix[r * size + col] += v;
-        k += 3;
+    for (&row, &v) in c.voltage_source_branch_rows.iter().zip(&c.voltage_source_values) {
+        c.base_rhs[row as usize] = v;
     }
-    // GMIN diagonal entries are handled inside solve_dc_internal
-    for (idx, &row) in c.voltage_source_branch_rows.iter().enumerate() {
-        c.base_rhs[row as usize] = c.voltage_source_values[idx];
-    }
-    // Inductor branch rows: keep just the incidence terms (already in
-    // static_stamps).  No L/dt coefficient → V_a − V_b = 0 (short).
 
     // ── Warm-start est buffer ──────────────────────────────────────────
     let mut est = vec![0.0; size];
-
-    // Warm start for BJTs
-    for ti in 0..c.transistor_count {
-        let el_idx = c.transistor_indices[ti];
-        let polarity = match &c.elements[el_idx] {
-            Element::Transistor { params, .. } => params.polarity,
-            _ => unreachable!(),
-        };
+    for (ti, &el_idx) in c.transistor_indices.iter().enumerate() {
+        let Element::Transistor { params, .. } = &c.elements[el_idx] else { unreachable!() };
         let bi = c.transistor_node_indices[ti * 3];
         let ci_ = c.transistor_node_indices[ti * 3 + 1];
         let ei = c.transistor_node_indices[ti * 3 + 2];
-        match polarity {
-            crate::types::Polarity::Npn => {
-                if ei >= 0 { est[ei as usize] = 0.0; }
-                if bi >= 0 { est[bi as usize] = 0.6; }
-                if ci_ >= 0 { est[ci_ as usize] = max_vcc * 0.5; }
-            }
-            crate::types::Polarity::Pnp => {
-                if ei >= 0 { est[ei as usize] = max_vcc; }
-                if bi >= 0 { est[bi as usize] = max_vcc * 0.9; }
-                if ci_ >= 0 { est[ci_ as usize] = max_vcc * 0.5; }
-            }
-        }
+        let (ve, vb, vc) = match params.polarity {
+            crate::types::Polarity::Npn => (0.0, 0.6, max_vcc * 0.5),
+            crate::types::Polarity::Pnp => (max_vcc, max_vcc * 0.9, max_vcc * 0.5),
+        };
+        if ei >= 0 { est[ei as usize] = ve; }
+        if bi >= 0 { est[bi as usize] = vb; }
+        if ci_ >= 0 { est[ci_ as usize] = vc; }
     }
 
     let mut actual_iters = 0;
@@ -629,7 +498,7 @@ pub fn solve_dc(
     //                                            send plain Newton into a
     //                                            limit cycle even with gmin.
     let mut prev_est = est.clone();
-    match solve_dc_internal(c, state, GMIN, &mut est) {
+    match dc_newton(c, state, GMIN, &mut est, None, 1.0, 1e-3) {
         Ok(iters) => {
             actual_iters = iters;
         }
@@ -650,16 +519,13 @@ pub fn solve_dc(
             let mut gmin_current = GMIN_START;
             let mut gmin_ok = true;
             for _ in 0..=GMIN_STEPS {
-                match solve_dc_internal_with_limiting(
-                    c, state, gmin_current, &mut est_gmin, &mut prev_gmin, 1.0,
+                match dc_newton(
+                    c, state, gmin_current, &mut est_gmin, Some(&mut prev_gmin), 1.0, 1e-6,
                 ) {
                     Ok(it) => gmin_iters += it,
                     Err(_) => { gmin_ok = false; break; }
                 }
-                gmin_current *= factor;
-                if gmin_current < gmin_target {
-                    gmin_current = gmin_target;
-                }
+                gmin_current = (gmin_current * factor).max(gmin_target);
             }
 
             if gmin_ok {
@@ -690,7 +556,7 @@ pub fn solve_dc(
                     .collect();
 
                 // Cold start from zero: at zero drive the solution is ~0.
-                for v in est.iter_mut() { *v = 0.0; }
+                est.fill(0.0);
                 prev_est.copy_from_slice(&est);
 
                 let mut src_ok = true;
@@ -699,8 +565,8 @@ pub fn solve_dc(
                     for &(row, val) in &saved {
                         c.base_rhs[row] = scale * val;
                     }
-                    match solve_dc_internal_with_limiting(
-                        c, state, GMIN, &mut est, &mut prev_est, SRC_DAMP,
+                    match dc_newton(
+                        c, state, GMIN, &mut est, Some(&mut prev_est), SRC_DAMP, 1e-6,
                     ) {
                         Ok(it) => actual_iters += it,
                         Err(_) => { src_ok = false; break; }
@@ -722,50 +588,44 @@ pub fn solve_dc(
 
     // ── Commit DC solution into state ──────────────────────────────────
     // Belt-and-braces NaN guard: refuses to commit if any est element is
-    // non-finite.  The in-loop guard above already catches this, but if
-    // a future code path slips a non-finite value past it, this final
-    // check prevents NaN from poisoning state.node_volts (which would
-    // cause every subsequent transient step's warm-start to be NaN and
-    // make recovery impossible).
-    for i in 0..n {
-        if !est[i].is_finite() {
-            return Err(DcIssue::DidNotConverge);
-        }
+    // non-finite, so NaN can never poison state.node_volts (which would
+    // make every subsequent transient warm-start NaN).
+    if !est[..n].iter().all(|v| v.is_finite()) {
+        return Err(DcIssue::DidNotConverge);
     }
     // Don't write into prev_* buffers — the first transient step after DC
     // should use BE, not BDF-2 (TS behaviour).  Clear gear2_ready.
-    state.node_volts.copy_from_slice(&est[..n]);
-    for ci in 0..c.cap_count {
-        let ia = c.cap_stamp_indices[ci * 4];
-        let ib = c.cap_stamp_indices[ci * 4 + 1];
-        let va = if ia >= 0 { est[ia as usize] } else { 0.0 };
-        let vb = if ib >= 0 { est[ib as usize] } else { 0.0 };
-        state.cap_volts[ci] = va - vb;
-    }
-    for li in 0..c.inductor_count {
-        let br = c.inductor_branch_rows[li] as usize;
-        state.inductor_currents[li] = est[br];
-    }
-    // Capture voltage-source branch currents from augmented MNA rows.
-    // Layout: est[0..n] = node volts, est[n..n+m] = VS currents,
-    // est[n+m..n+m+inductor_count] = inductor branch currents.
-    for vi in 0..c.m {
-        state.voltage_source_currents[vi] = est[n + vi];
-    }
-    for ti in 0..c.transistor_count {
-        let bi = c.transistor_node_indices[ti * 3];
-        let ci_ = c.transistor_node_indices[ti * 3 + 1];
-        let ei = c.transistor_node_indices[ti * 3 + 2];
-        let vb = if bi >= 0 { est[bi as usize] } else { 0.0 };
-        let vc = if ci_ >= 0 { est[ci_ as usize] } else { 0.0 };
-        let ve = if ei >= 0 { est[ei as usize] } else { 0.0 };
-        state.tj_cap_volts[2 * ti]     = vb - ve;
-        state.tj_cap_volts[2 * ti + 1] = vb - vc;
-    }
+    commit_solution(c, state, &est);
     state.gear2_ready = false;
     state.prev_dt = 0.0;
 
     Ok(actual_iters)
+}
+
+/// Write a solved MNA vector into the per-element state.
+///
+/// Layout: `est[0..n]` = node volts, `est[n..n+m]` = VS currents,
+/// `est[n+m..]` = inductor branch currents.
+fn commit_solution(c: &CompiledNetlist, state: &mut TransientState, est: &[f64]) {
+    let n = c.n;
+    let node_v = |idx: i32| if idx >= 0 { est[idx as usize] } else { 0.0 };
+
+    state.node_volts.copy_from_slice(&est[..n]);
+    for (cv, ix) in state.cap_volts.iter_mut().zip(c.cap_stamp_indices.chunks_exact(4)) {
+        *cv = node_v(ix[0]) - node_v(ix[1]);
+    }
+    for (i, &br) in state.inductor_currents.iter_mut().zip(&c.inductor_branch_rows) {
+        *i = est[br as usize];
+    }
+    state.voltage_source_currents.copy_from_slice(&est[n..n + c.m]);
+    // Transistor junction-cap voltages (Vbe, Vbc).
+    for (tj, ix) in state.tj_cap_volts.chunks_exact_mut(2)
+        .zip(c.transistor_node_indices.chunks_exact(3))
+    {
+        let vb = node_v(ix[0]);
+        tj[0] = vb - node_v(ix[2]);
+        tj[1] = vb - node_v(ix[1]);
+    }
 }
 
 /// Advances the simulation by one timestep using Backward Euler.
@@ -778,10 +638,27 @@ pub fn step(
 }
 
 /// Advances the simulation by one timestep using the specified configuration.
+///
+/// Allocation-free: all scratch lives in the `CompiledNetlist`.
 pub fn step_with_config(
     c: &mut CompiledNetlist,
     state: &mut TransientState,
     config: StepConfig,
+) -> Result<StepResult, StepIssue> {
+    // Detach the Newton scratch so it can be borrowed alongside `c`; this is
+    // a pointer swap, not an allocation.  Always reattached before return.
+    let mut est = std::mem::take(&mut c.est);
+    est.resize(c.size, 0.0);
+    let result = step_inner(c, state, config, &mut est);
+    c.est = est;
+    result
+}
+
+fn step_inner(
+    c: &mut CompiledNetlist,
+    state: &mut TransientState,
+    config: StepConfig,
+    est: &mut [f64],
 ) -> Result<StepResult, StepIssue> {
     let dt = config.dt;
     if dt <= 0.0 || !dt.is_finite() {
@@ -791,13 +668,6 @@ pub fn step_with_config(
     let size = c.size;
     let n = c.n;
 
-    // Capture state BEFORE commitment for LTE estimation if requested.
-    // We need state_{n-1} and state_{n-2} to compare with the new state_{n}.
-    // At this point:
-    // state.node_volts is x_{n-1}
-    // state.prev_node_volts is x_{n-2}
-    // state.prev2_node_volts is x_{n-3}
-    
     let use_gear2 = config.gear == Gear::Bdf2 && state.gear2_ready;
     let can_predict = state.gear2_ready && state.prev_dt > 0.0;
     let dt_ratio = if can_predict { (dt / state.prev_dt).min(4.0) } else { 0.0 };
@@ -806,19 +676,11 @@ pub fn step_with_config(
     // Everything that doesn't change between Newton iterations goes here.
     // Each iteration copies this into the working matrix, stamps the
     // nonlinear contributions on top, factors, solves.
-    c.base_matrix.fill(0.0);
+    //
+    // Static stamps (resistors + voltage-source incidence) come
+    // pre-accumulated from compile time.
+    c.base_matrix.copy_from_slice(&c.static_matrix);
     c.base_rhs.fill(0.0);
-
-    // Static stamps (resistors + voltage-source incidence).
-    let stamps = &c.static_stamps;
-    let mut k = 0;
-    while k < stamps.len() {
-        let r = stamps[k] as usize;
-        let col = stamps[k + 1] as usize;
-        let v = stamps[k + 2];
-        c.base_matrix[r * size + col] += v;
-        k += 3;
-    }
 
     // gmin diagonal regularisation.
     for &g_idx in &c.gmin_indices {
@@ -826,37 +688,29 @@ pub fn step_with_config(
     }
 
     // Voltage-source RHS — V_pos − V_neg = V_src.
-    for (idx, &row) in c.voltage_source_branch_rows.iter().enumerate() {
-        c.base_rhs[row as usize] = c.voltage_source_values[idx];
+    for (&row, &v) in c.voltage_source_branch_rows.iter().zip(&c.voltage_source_values) {
+        c.base_rhs[row as usize] = v;
     }
 
-    // Capacitor companion: Backward Euler.  For each cap with previous
-    // voltage Vp, conductance is g = C/dt and the companion current is
     // Capacitor companion.  Backward Euler: g = C/dt, ieq = g·V_prev.
     // BDF-2 (when gear2_ready): g = 3C/(2·dt), ieq = (C/(2·dt))·(4·V_prev − V_prev2).
     // BDF-2 reduces to BE structurally — same stamp positions, different
-    // coefficients — so the stamp loop is unchanged below.
-    for ci in 0..c.cap_count {
-        let el_idx = c.capacitor_indices[ci];
-        let cap_f = match &c.elements[el_idx] {
-            Element::Capacitor { capacitance_farads, .. } => *capacitance_farads,
-            _ => unreachable!("capacitor_indices points to a non-capacitor"),
+    // coefficients.
+    for (ci, &el_idx) in c.capacitor_indices.iter().enumerate() {
+        let Element::Capacitor { capacitance_farads: cap_f, .. } = c.elements[el_idx] else {
+            unreachable!("capacitor_indices points to a non-capacitor")
         };
         let prev_v = state.cap_volts[ci];
-        let prev2_v = if use_gear2 { state.prev_cap_volts[ci] } else { 0.0 };
         let (g, ieq) = if use_gear2 {
-            let g = (3.0 * cap_f) / (2.0 * dt);
-            let ieq = (cap_f / (2.0 * dt)) * (4.0 * prev_v - prev2_v);
-            (g, ieq)
+            let prev2_v = state.prev_cap_volts[ci];
+            ((3.0 * cap_f) / (2.0 * dt), (cap_f / (2.0 * dt)) * (4.0 * prev_v - prev2_v))
         } else {
             let g = cap_f * dt_inv;
             (g, g * prev_v)
         };
 
-        let ia = c.cap_stamp_indices[ci * 4];
-        let ib = c.cap_stamp_indices[ci * 4 + 1];
-        let ab = c.cap_stamp_indices[ci * 4 + 2];
-        let ba = c.cap_stamp_indices[ci * 4 + 3];
+        let ix = &c.cap_stamp_indices[ci * 4..ci * 4 + 4];
+        let (ia, ib, ab, ba) = (ix[0], ix[1], ix[2], ix[3]);
         if ia >= 0 {
             c.base_matrix[(ia as usize) * size + (ia as usize)] += g;
             c.base_rhs[ia as usize] += ieq;
@@ -878,26 +732,23 @@ pub fn step_with_config(
     // The branch equation is V_a − V_b − coeff·I_new = -rhs.
     //
     // Inductor saturation: when |I_prev| exceeds `saturation_current_a`,
-    // the effective inductance drops to 1% of nominal (rust-e-sim-core saturates,
+    // the effective inductance drops to 1% of nominal (core saturates,
     // inductance collapses).  Matches the TS reference's simple two-state
     // saturation model.
-    for li in 0..c.inductor_count {
-        let el_idx = c.inductor_indices[li];
-        let (l_nominal, i_sat) = match &c.elements[el_idx] {
-            Element::Inductor { inductance_henry, saturation_current_a, .. } =>
-                (*inductance_henry, *saturation_current_a),
-            _ => unreachable!(),
+    for (li, &el_idx) in c.inductor_indices.iter().enumerate() {
+        let Element::Inductor { inductance_henry: l_nominal, saturation_current_a: i_sat, .. } =
+            c.elements[el_idx]
+        else {
+            unreachable!("inductor_indices points to a non-inductor")
         };
         let prev_i = state.inductor_currents[li];
-        let prev2_i = if use_gear2 { state.prev_inductor_currents[li] } else { 0.0 };
         let l_eff = match i_sat {
             Some(isat) if prev_i.abs() > isat => l_nominal * 0.01,
             _ => l_nominal,
         };
         let (coeff, rhs_val) = if use_gear2 {
-            let coeff = (3.0 * l_eff) / (2.0 * dt);
-            let rhs_val = (l_eff / (2.0 * dt)) * (4.0 * prev_i - prev2_i);
-            (coeff, rhs_val)
+            let prev2_i = state.prev_inductor_currents[li];
+            ((3.0 * l_eff) / (2.0 * dt), (l_eff / (2.0 * dt)) * (4.0 * prev_i - prev2_i))
         } else {
             let coeff = l_eff * dt_inv;
             (coeff, coeff * prev_i)
@@ -915,15 +766,13 @@ pub fn step_with_config(
     //   rhs[branch_i]              −= M_rhs
     // The pair list contains both (i, j) and (j, i) so the matrix is
     // symmetric without an explicit transpose stamp.
-    let pairs = &c.inductor_coupling_pairs;
-    let mut p = 0;
-    while p < pairs.len() {
-        let i_idx = pairs[p] as usize;
-        let j_idx = pairs[p + 1] as usize;
-        let m_signed = pairs[p + 2];
+    for pair in c.inductor_coupling_pairs.chunks_exact(3) {
+        let i_idx = pair[0] as usize;
+        let j_idx = pair[1] as usize;
+        let m_signed = pair[2];
         let prev_j = state.inductor_currents[j_idx];
-        let prev2_j = if use_gear2 { state.prev_inductor_currents[j_idx] } else { 0.0 };
         let (m_coeff, m_rhs) = if use_gear2 {
+            let prev2_j = state.prev_inductor_currents[j_idx];
             ((3.0 * m_signed) / (2.0 * dt),
              (m_signed / (2.0 * dt)) * (4.0 * prev_j - prev2_j))
         } else {
@@ -933,7 +782,6 @@ pub fn step_with_config(
         let br_j = c.inductor_branch_rows[j_idx] as usize;
         c.base_matrix[br_i * size + br_j] -= m_coeff;
         c.base_rhs[br_i] -= m_rhs;
-        p += 3;
     }
 
     // ── Initial Newton estimate ─────────────────────────────────────────
@@ -941,19 +789,19 @@ pub fn step_with_config(
     // the previous step's node voltages.  With a predictor (gear2_ready +
     // prev_dt > 0), linearly extrapolate forward by dt_ratio = dt/prev_dt
     // and clip to PREDICTOR_CLIP to stay inside the pnjlim-safe region.
-    let mut est = vec![0.0; size];
+    // Branch entries start at zero; they're computed by the first solve.
     if can_predict {
-        for i in 0..n {
-            let curr = state.node_volts[i];
-            let prev = state.prev_node_volts[i];
+        for ((e, &curr), &prev) in est[..n].iter_mut()
+            .zip(&state.node_volts)
+            .zip(&state.prev_node_volts)
+        {
             let delta = (curr - prev) * dt_ratio;
-            let clipped = delta.max(-PREDICTOR_CLIP).min(PREDICTOR_CLIP);
-            est[i] = curr + clipped;
+            *e = curr + delta.clamp(-PREDICTOR_CLIP, PREDICTOR_CLIP);
         }
     } else {
         est[..n].copy_from_slice(&state.node_volts);
     }
-    // Branch entries start at zero; they'll be computed in the first solve.
+    est[n..].fill(0.0);
 
     // ── Newton iteration ────────────────────────────────────────────────
     // Loop budget matches TS: linear systems run exactly once (the SPICE
@@ -962,7 +810,6 @@ pub fn step_with_config(
     // early break.
     let max_iters = total_iterations(c.transistor_count, c.diode_count, c.relay_count);
     let mut actual_iters = 0;
-    let mut solved = false;
     let mut prev_raw_max_delta = f64::INFINITY;
     // With predictor active, accept convergence as early as iteration 1;
     // without one, require 2 iterations to avoid committing to an
@@ -972,196 +819,21 @@ pub fn step_with_config(
     for iteration in 0..max_iters {
         actual_iters = iteration + 1;
 
-        // Restore from base.
-        c.matrix.copy_from_slice(&c.base_matrix);
-        c.rhs.copy_from_slice(&c.base_rhs);
-
-        // Stamp transistors.
-        for ti in 0..c.transistor_count {
-            let el_idx = c.transistor_indices[ti];
-            let q = match &c.elements[el_idx] {
-                Element::Transistor { params, .. } => params,
-                _ => unreachable!(),
-            };
-            let bi = c.transistor_node_indices[ti * 3];
-            let ci_ = c.transistor_node_indices[ti * 3 + 1];
-            let ei = c.transistor_node_indices[ti * 3 + 2];
-            // Transient mode — pass previous-step node voltages so the
-            // BJT stamp can engage SPICE pnjlim, limiting how far Vbe can
-            // swing per step.  Without this Newton oversteps the BJT's
-            // narrow active region in one iteration and the cap-stabilised
-            // turn-on/off transitions get short-circuited.
-            let s = compute_transistor_stamp(
-                q, &est[..n], bi, ci_, ei, Some(&state.node_volts),
-            );
-
-            // BJT MNA stamps.  Sign conventions match transient.ts.
-            //   I_B / I_C / I_E linearised around (Vbe, Vbc):
-            //     I_C = gm·Vbe + gmu·Vbc + iEqC
-            //     I_B = gpi·Vbe + gmu_b·Vbc + iEqB
-            //   (I_E by KCL: I_E = -(I_C + I_B), so its stamp follows.)
-            stamp_bjt(
-                &mut c.matrix, &mut c.rhs, size, bi, ci_, ei,
-                s.gm, s.gmu, s.gpi, s.gmu_b,
-                s.i_eq_b, s.i_eq_c, s.i_eq_e,
-            );
-
-            // Junction + diffusion capacitance — REQUIRED for correct
-            // large-signal switching dynamics.  Without these stamps,
-            // BJTs in blocking-oscillator circuits (metronome, siren)
-            // switch instantly, run at 10× the correct rate, and produce
-            // ~20 dB lower speaker swing because there's no charge
-            // storage to integrate.  TS uses plain BE for these caps
-            // (not BDF-2); we match that here.
-            //
-            // C_BE = cje + tf · gm     (junction + forward diffusion)
-            // C_BC = cjc + tr · gmu_b  (junction + reverse diffusion)
-            let tf = q.tf_seconds.unwrap_or(0.0);
-            let tr = q.tr_seconds.unwrap_or(0.0);
-            let cbe_total = q.cje_farads + tf * s.gm;
-            let cbc_total = q.cjc_farads + tr * s.gmu_b;
-            if cbe_total > 0.0 {
-                let g = cbe_total * dt_inv;
-                let v_prev = state.tj_cap_volts[2 * ti];
-                stamp_two_node_cap(&mut c.matrix, &mut c.rhs, size, bi, ei, g, g * v_prev);
-            }
-            if cbc_total > 0.0 {
-                let g = cbc_total * dt_inv;
-                let v_prev = state.tj_cap_volts[2 * ti + 1];
-                stamp_two_node_cap(&mut c.matrix, &mut c.rhs, size, bi, ci_, g, g * v_prev);
-            }
-        }
-
-        // Stamp diodes.
-        for di in 0..c.diode_count {
-            let el_idx = c.diode_indices[di];
-            let d = match &c.elements[el_idx] {
-                Element::Diode { params, .. } => params,
-                _ => unreachable!(),
-            };
-            let ai = c.diode_node_indices[di * 2];
-            let ki = c.diode_node_indices[di * 2 + 1];
-            let s = compute_diode_stamp(d, &est[..n], ai, ki, None);
-
-            // Diode MNA stamps:
-            //   Y[a,a] += gd; Y[k,k] += gd; Y[a,k] -= gd; Y[k,a] -= gd
-            //   rhs[a] -= ieq; rhs[k] += ieq
-            if ai >= 0 {
-                let ai = ai as usize;
-                c.matrix[ai * size + ai] += s.gd;
-                c.rhs[ai] -= s.ieq;
-            }
-            if ki >= 0 {
-                let ki = ki as usize;
-                c.matrix[ki * size + ki] += s.gd;
-                c.rhs[ki] += s.ieq;
-            }
-            if ai >= 0 && ki >= 0 {
-                c.matrix[(ai as usize) * size + (ki as usize)] -= s.gd;
-                c.matrix[(ki as usize) * size + (ai as usize)] -= s.gd;
-            }
-        }
-
-        // Stamp relays per current state.relay_active flags.  These are
-        // linear resistive stamps whose values change when relay_active
-        // flips; the flip happens in update_relay_states (called below
-        // after the solve), and the next iter re-stamps with the new
-        // contact conductances.
-        stamp_relays(&mut c.matrix, size, c.relay_count, &c.relay_indices, &c.relay_node_indices, &c.elements, &state.relay_active);
-
-        // ── Solve (sparse first, dense fallback) ────────────────────────
-        let solve_result = if numeric_factor(&mut c.matrix, size, &c.sparse_pattern) {
-            sparse_solve_in_place(&c.matrix, &mut c.rhs, size, &c.sparse_pattern);
-            Some(())
-        } else {
-            // Restore matrix from base — numeric_factor mutated it.
-            c.matrix.copy_from_slice(&c.base_matrix);
-            // Re-stamp transistors and diodes for the dense path.  This
-            // is the rare singular-pivot fallback; we accept the cost.
-            for ti in 0..c.transistor_count {
-                let el_idx = c.transistor_indices[ti];
-                let q = match &c.elements[el_idx] {
-                    Element::Transistor { params, .. } => params,
-                    _ => unreachable!(),
-                };
-                let bi = c.transistor_node_indices[ti * 3];
-                let ci_ = c.transistor_node_indices[ti * 3 + 1];
-                let ei = c.transistor_node_indices[ti * 3 + 2];
-                // Same pnjlim engagement as the sparse path above.
-                let s = compute_transistor_stamp(
-                    q, &est[..n], bi, ci_, ei, Some(&state.node_volts),
-                );
-                stamp_bjt(
-                    &mut c.matrix, &mut c.rhs, size, bi, ci_, ei,
-                    s.gm, s.gmu, s.gpi, s.gmu_b,
-                    s.i_eq_b, s.i_eq_c, s.i_eq_e,
-                );
-                // Junction + diffusion capacitance — same as the sparse
-                // path above (the sparse mutation invalidated the matrix
-                // so we rebuild from base_matrix here and must re-stamp
-                // everything, junction caps included).
-                let tf = q.tf_seconds.unwrap_or(0.0);
-                let tr = q.tr_seconds.unwrap_or(0.0);
-                let cbe_total = q.cje_farads + tf * s.gm;
-                let cbc_total = q.cjc_farads + tr * s.gmu_b;
-                if cbe_total > 0.0 {
-                    let g = cbe_total * dt_inv;
-                    let v_prev = state.tj_cap_volts[2 * ti];
-                    stamp_two_node_cap(&mut c.matrix, &mut c.rhs, size, bi, ei, g, g * v_prev);
-                }
-                if cbc_total > 0.0 {
-                    let g = cbc_total * dt_inv;
-                    let v_prev = state.tj_cap_volts[2 * ti + 1];
-                    stamp_two_node_cap(&mut c.matrix, &mut c.rhs, size, bi, ci_, g, g * v_prev);
-                }
-            }
-            for di in 0..c.diode_count {
-                let el_idx = c.diode_indices[di];
-                let d = match &c.elements[el_idx] {
-                    Element::Diode { params, .. } => params,
-                    _ => unreachable!(),
-                };
-                let ai = c.diode_node_indices[di * 2];
-                let ki = c.diode_node_indices[di * 2 + 1];
-                let s = compute_diode_stamp(d, &est[..n], ai, ki, None);
-                if ai >= 0 {
-                    let ai = ai as usize;
-                    c.matrix[ai * size + ai] += s.gd;
-                    c.rhs[ai] -= s.ieq;
-                }
-                if ki >= 0 {
-                    let ki = ki as usize;
-                    c.matrix[ki * size + ki] += s.gd;
-                    c.rhs[ki] += s.ieq;
-                }
-                if ai >= 0 && ki >= 0 {
-                    c.matrix[(ai as usize) * size + (ki as usize)] -= s.gd;
-                    c.matrix[(ki as usize) * size + (ai as usize)] -= s.gd;
-                }
-            }
-            // Relays in the dense fallback too — same call as sparse path.
-            stamp_relays(&mut c.matrix, size, c.relay_count, &c.relay_indices, &c.relay_node_indices, &c.elements, &state.relay_active);
-            match solve_linear_system(&mut c.matrix, &mut c.rhs, size) {
-                Some(x) => {
-                    c.rhs.copy_from_slice(&x);
-                    Some(())
-                }
-                None => None,
-            }
+        // Transient mode: BJTs get pnjlim against the previous step's node
+        // voltages plus junction-cap companions; diodes run unlimited
+        // (matches TS).
+        let mode = StampMode {
+            bjt_prev: Some(&state.node_volts),
+            diode_prev: None,
+            junction_caps: Some((&state.tj_cap_volts, dt_inv)),
         };
-
-        if solve_result.is_none() {
+        if !assemble_and_solve(c, None, est, &state.relay_active, mode) {
             return Err(StepIssue::SingularMatrix);
         }
 
         // ── Damped update + convergence check ───────────────────────────
-        let mut raw_max_delta = 0.0_f64;
-        for i in 0..n {
-            let d = (c.rhs[i] - est[i]).abs();
-            if d > raw_max_delta {
-                raw_max_delta = d;
-            }
-        }
+        let raw_max_delta = c.rhs[..n].iter().zip(&est[..n])
+            .fold(0.0_f64, |m, (&new_v, &old_v)| m.max((new_v - old_v).abs()));
         // Damping matches transient.ts: full step at iteration 0; heavy
         // damping when raw delta doubled (divergence warning); moderate
         // otherwise.
@@ -1177,35 +849,25 @@ pub fn step_with_config(
         prev_raw_max_delta = raw_max_delta;
 
         let mut max_delta = 0.0_f64;
+        let mut max_v = 0.0_f64;
         let mut saw_nan = false;
-        for i in 0..n {
-            let new_v = c.rhs[i];
-            let old_v = est[i];
-            let mut delta = new_v - old_v;
-            if delta > STEP_LIMIT {
-                delta = STEP_LIMIT;
-            } else if delta < -STEP_LIMIT {
-                delta = -STEP_LIMIT;
-            }
-            est[i] = old_v + damping * delta;
-            if !est[i].is_finite() { saw_nan = true; }
-            let abs_delta = delta.abs();
-            if abs_delta > max_delta {
-                max_delta = abs_delta;
-            }
+        for (e, &new_v) in est[..n].iter_mut().zip(&c.rhs[..n]) {
+            let old_v = *e;
+            let delta = (new_v - old_v).clamp(-STEP_LIMIT, STEP_LIMIT);
+            *e = old_v + damping * delta;
+            if !e.is_finite() { saw_nan = true; }
+            max_delta = max_delta.max(delta.abs());
+            max_v = max_v.max(e.abs());
         }
-        for i in n..size {
-            est[i] = c.rhs[i];
-            if !est[i].is_finite() { saw_nan = true; }
+        for (e, &new_v) in est[n..].iter_mut().zip(&c.rhs[n..size]) {
+            *e = new_v;
+            if !e.is_finite() { saw_nan = true; }
         }
-        // NaN guard: if Newton produced any non-finite iterate, abort
-        // the step.  Without this, the loop continues and `est` stays
-        // NaN forever (NaN comparisons in convergence checks all
-        // evaluate false, so Newton runs until budget exhaustion, then
-        // commits NaN state).  Returning NewtonDidNotConverge lets the
-        // caller recover via DC reseed.  Pre-commit recovery preserves
-        // the prev_* buffers — caller can either retry with smaller dt
-        // or restart from DC.
+        // NaN guard: if Newton produced any non-finite iterate, abort the
+        // step.  NaN comparisons all evaluate false, so without this Newton
+        // would run to budget exhaustion and commit NaN state.  Returning
+        // before commit preserves the prev_* buffers so the caller can
+        // retry with a smaller dt or reseed from DC.
         if saw_nan {
             return Err(StepIssue::NewtonDidNotConverge);
         }
@@ -1214,50 +876,23 @@ pub fn step_with_config(
         // a relay can flip mid-Newton when its coil voltage crosses the
         // on/off thresholds with hysteresis, and the next stamp pass picks
         // up the new contact resistance.
-        update_relay_states(&mut state.relay_active, c.relay_count, &c.relay_indices, &c.relay_node_indices, &c.elements, &est);
+        update_relay_states(
+            &mut state.relay_active, &c.relay_indices,
+            &c.relay_node_indices, &c.elements, est,
+        );
 
-        let mut max_v = 0.0_f64;
-        for i in 0..n {
-            let av = est[i].abs();
-            if av > max_v {
-                max_v = av;
-            }
-        }
-        // Matches TS: only accept convergence after min_converge_iter to
-        // avoid committing to an unconverged warm-start (when there's no
-        // predictor).  For linear systems max_iters is 1 and this branch
-        // is never taken — the for-loop exits normally after one iteration.
+        // Only accept convergence after min_converge_iter to avoid
+        // committing to an unconverged warm-start.  Newton may also not
+        // formally converge within the budget — TS doesn't treat that as a
+        // failure (the step-limit clamp keeps the iterate bounded), so the
+        // final est is committed regardless.
         if iteration >= min_converge_iter && max_delta < NEWTON_RTOL * max_v + NEWTON_ATOL {
-            solved = true;
             break;
         }
     }
 
-    // Newton may not formally converge within the budget — TS doesn't
-    // treat that as a failure either (the budget is intentionally tight
-    // for performance, and the step-limit clamp keeps the iterate bounded
-    // even if it never settles within tolerance).  We commit the final
-    // est regardless of formal convergence.  Catastrophic failures
-    // (singular matrix) and NaN divergence are reported separately above.
-    let _ = solved; // kept for symmetry; not used as a failure signal
-
-    // Belt-and-braces NaN guard before committing.  The in-loop guard
-    // above should already catch NaN, but if a singular-near-singular
-    // solve produced finite garbage that overflowed in `damping * delta`
-    // or any other arithmetic, double-check here.  Committing NaN to
-    // state.node_volts would corrupt every subsequent step (and every
-    // subsequent audio sample read via node_voltage()).
-    for i in 0..n {
-        if !est[i].is_finite() {
-            return Err(StepIssue::NewtonDidNotConverge);
-        }
-    }
-
     // ── Commit solution into state ──────────────────────────────────────
-    // Order matters: save the current-step values into prev_* buffers
-    // BEFORE overwriting state with the new step.  Use mem::swap to avoid
-    // allocations — the old prev_* contents are stale anyway and will be
-    // overwritten with the new "current" values on the next step.
+    // Shift history BEFORE overwriting state with the new step.
     state.prev2_node_volts.copy_from_slice(&state.prev_node_volts);
     state.prev_node_volts.copy_from_slice(&state.node_volts);
 
@@ -1267,38 +902,7 @@ pub fn step_with_config(
     state.prev2_inductor_currents.copy_from_slice(&state.prev_inductor_currents);
     state.prev_inductor_currents.copy_from_slice(&state.inductor_currents);
 
-    state.node_volts.copy_from_slice(&est[..n]);
-
-    for ci in 0..c.cap_count {
-        let ia = c.cap_stamp_indices[ci * 4];
-        let ib = c.cap_stamp_indices[ci * 4 + 1];
-        let va = if ia >= 0 { est[ia as usize] } else { 0.0 };
-        let vb = if ib >= 0 { est[ib as usize] } else { 0.0 };
-        state.cap_volts[ci] = va - vb;
-    }
-
-    for li in 0..c.inductor_count {
-        let br = c.inductor_branch_rows[li] as usize;
-        state.inductor_currents[li] = est[br];
-    }
-
-    // Capture voltage-source branch currents (augmented MNA rows n..n+m).
-    for vi in 0..c.m {
-        state.voltage_source_currents[vi] = est[n + vi];
-    }
-
-    // Transistor junction-cap voltages (Vbe, Vbc) — kept consistent with
-    // TS even though it doesn't yet use them in the cap companion.
-    for ti in 0..c.transistor_count {
-        let bi = c.transistor_node_indices[ti * 3];
-        let ci_ = c.transistor_node_indices[ti * 3 + 1];
-        let ei = c.transistor_node_indices[ti * 3 + 2];
-        let vb = if bi >= 0 { est[bi as usize] } else { 0.0 };
-        let vc = if ci_ >= 0 { est[ci_ as usize] } else { 0.0 };
-        let ve = if ei >= 0 { est[ei as usize] } else { 0.0 };
-        state.tj_cap_volts[2 * ti]     = vb - ve;
-        state.tj_cap_volts[2 * ti + 1] = vb - vc;
-    }
+    commit_solution(c, state, est);
 
     let gear2_already_ready = state.gear2_ready;
 
@@ -1308,27 +912,16 @@ pub fn step_with_config(
 
     let mut lte = None;
     if config.estimate_lte && gear2_already_ready {
-        // Simple LTE estimation using divided differences.
-        // At this point, state.node_volts is the NEW solution x_n.
-        // state.prev_node_volts is x_{n-1}.
-        // state.prev2_node_volts is x_{n-2}.
-        
-        let mut max_lte = 0.0;
-        for i in 0..n {
-            let xn = state.node_volts[i];
-            let xn1 = state.prev_node_volts[i];
-            let xn2 = state.prev2_node_volts[i];
-            
-            let d2x = (xn - 2.0 * xn1 + xn2).abs(); // approx dt^2 * |x''|
-            let err = if use_gear2 {
-                // BDF-2 LTE is O(dt^3), usually smaller. 
-                // Very rough approx:
-                0.22 * d2x // Simplified
-            } else {
-                0.5 * d2x
-            };
-            if err > max_lte { max_lte = err; }
-        }
+        // Simple LTE estimation using divided differences on the new
+        // solution x_n and the history x_{n-1}, x_{n-2}.
+        // BDF-2 LTE is O(dt^3), usually smaller — very rough 0.22 factor.
+        let scale = if use_gear2 { 0.22 } else { 0.5 };
+        let max_lte = state.node_volts.iter()
+            .zip(&state.prev_node_volts)
+            .zip(&state.prev2_node_volts)
+            .fold(0.0_f64, |m, ((&xn, &xn1), &xn2)| {
+                m.max(scale * (xn - 2.0 * xn1 + xn2).abs()) // ≈ dt²·|x''|
+            });
         lte = Some(max_lte);
     }
 
@@ -1364,6 +957,7 @@ fn stamp_two_node_conductance(matrix: &mut [f64], size: usize, ia: i32, ib: i32,
 ///   - coil:                   1 / Rcoil  between (coil+, coil-)
 ///   - active contact:         1 / Ron    between (common, active throw)
 ///   - inactive contact:       1 / Roff   between (common, inactive throw)
+///
 /// Active throw is NC when relay_active=false (rest state), NO otherwise.
 ///
 /// Called inside the per-iteration Newton stamp pass; pairs with
@@ -1375,19 +969,17 @@ fn stamp_two_node_conductance(matrix: &mut [f64], size: usize, ia: i32, ib: i32,
 #[inline]
 fn stamp_relays(
     matrix: &mut [f64], size: usize,
-    relay_count: usize,
     relay_indices: &[usize],
     relay_node_indices: &[i32],
     elements: &[Element],
     relay_active: &[bool],
 ) {
-    for ri in 0..relay_count {
-        let coil_p = relay_node_indices[ri * 5];
-        let coil_n = relay_node_indices[ri * 5 + 1];
-        let cmn    = relay_node_indices[ri * 5 + 2];
-        let nc     = relay_node_indices[ri * 5 + 3];
-        let no     = relay_node_indices[ri * 5 + 4];
-        let (rcoil, ron, roff) = match &elements[relay_indices[ri]] {
+    for (ri, (&el_idx, ix)) in relay_indices.iter()
+        .zip(relay_node_indices.chunks_exact(5))
+        .enumerate()
+    {
+        let (coil_p, coil_n, cmn, nc, no) = (ix[0], ix[1], ix[2], ix[3], ix[4]);
+        let (rcoil, ron, roff) = match &elements[el_idx] {
             Element::Relay { coil_resistance_ohms, ron_ohms, roff_ohms, .. } => {
                 (*coil_resistance_ohms, *ron_ohms, *roff_ohms)
             }
@@ -1411,16 +1003,17 @@ fn stamp_relays(
 #[inline]
 fn update_relay_states(
     relay_active: &mut [bool],
-    relay_count: usize,
     relay_indices: &[usize],
     relay_node_indices: &[i32],
     elements: &[Element],
     est: &[f64],
 ) {
-    for ri in 0..relay_count {
-        let coil_p = relay_node_indices[ri * 5];
-        let coil_n = relay_node_indices[ri * 5 + 1];
-        let (rcoil, i_on, i_off) = match &elements[relay_indices[ri]] {
+    for (ri, (&el_idx, ix)) in relay_indices.iter()
+        .zip(relay_node_indices.chunks_exact(5))
+        .enumerate()
+    {
+        let (coil_p, coil_n) = (ix[0], ix[1]);
+        let (rcoil, i_on, i_off) = match &elements[el_idx] {
             Element::Relay {
                 coil_resistance_ohms, on_current, off_current, ..
             } => (*coil_resistance_ohms, *on_current, *off_current),
@@ -1961,7 +1554,7 @@ mod tests {
         // Build an est where V_coil_p = 0.5 V → I_coil = 5 mA (below off_current).
         probe_est[*compiled.node_index.get(&2).unwrap()] = 0.5;
         update_relay_states(
-            &mut probe_state.relay_active, compiled.relay_count,
+            &mut probe_state.relay_active,
             &compiled.relay_indices, &compiled.relay_node_indices,
             &compiled.elements, &probe_est,
         );
@@ -1973,7 +1566,7 @@ mod tests {
         let mut hold_state = state.clone();    // start energised
         probe_est[*compiled.node_index.get(&2).unwrap()] = 1.5; // 15 mA — in dead band
         update_relay_states(
-            &mut hold_state.relay_active, compiled.relay_count,
+            &mut hold_state.relay_active,
             &compiled.relay_indices, &compiled.relay_node_indices,
             &compiled.elements, &probe_est,
         );
@@ -2170,5 +1763,67 @@ mod tests {
         // Step 3: Now we have full history.
         let r3 = step_with_config(&mut compiled, &mut state, StepConfig::be(1e-4).with_lte()).unwrap();
         assert!(r3.lte.is_some());
+    }
+
+    /// When the sparse LU hits a zero pivot, the dense fallback must solve
+    /// the SAME system: matrix and RHS both rebuilt from base before
+    /// re-stamping (previously the RHS kept the first pass's device
+    /// stamps, so nonlinear companion currents were counted twice).
+    #[test]
+    fn dense_fallback_solves_the_assembled_system() {
+        use crate::types::Diode;
+        let mut nl = Netlist::new(0);
+        nl.push(Element::VoltageSource {
+            id: "V1".into(), positive_node: 1, negative_node: 0, voltage: 5.0,
+        });
+        nl.push(Element::Resistor {
+            id: "R1".into(), a: 1, b: 2, resistance_ohms: 1_000.0,
+        });
+        nl.push(Element::Diode {
+            id: "D1".into(), anode: 2, cathode: 0, params: Diode::shockley(1e-14, 1.0),
+        });
+        let mut c = compile_netlist(&nl).unwrap();
+        let state = TransientState::new(&c);
+        let size = c.size;
+
+        // Diode at 0.65 V so its stamp contributes non-zero gd and ieq.
+        let mut est = vec![0.0; size];
+        est[c.node_index[&1]] = 5.0;
+        est[c.node_index[&2]] = 0.65;
+        let mode = StampMode { bjt_prev: None, diode_prev: None, junction_caps: None };
+
+        c.base_matrix.copy_from_slice(&c.static_matrix);
+        c.base_rhs.fill(0.0);
+        c.base_rhs[c.voltage_source_branch_rows[0] as usize] = 5.0;
+
+        // The fully assembled system the solver should be solving.
+        let mut a = c.base_matrix.clone();
+        for &g in &c.gmin_indices { a[g as usize] += GMIN; }
+        let mut b = c.base_rhs.clone();
+        Devices {
+            size, n: c.n, elements: &c.elements,
+            transistor_models: &c.transistor_models,
+            transistor_node_indices: &c.transistor_node_indices,
+            diode_models: &c.diode_models,
+            diode_node_indices: &c.diode_node_indices,
+            relay_indices: &c.relay_indices,
+            relay_node_indices: &c.relay_node_indices,
+        }.stamp(&mut a, &mut b, &est, &state.relay_active, mode);
+
+        // Force a zero first pivot so `numeric_factor` bails out.
+        let a00 = a[0];
+        c.base_matrix[0] -= a00;
+        a[0] -= a00;
+        assert!(a[0].abs() < 1e-14, "setup: pivot not zeroed ({})", a[0]);
+        assert!(!numeric_factor(&mut a.clone(), size, &c.sparse_pattern),
+            "setup: sparse LU should fail on the zero pivot");
+
+        assert!(assemble_and_solve(&mut c, Some(GMIN), &est, &state.relay_active, mode));
+        let x = &c.rhs;
+        for i in 0..size {
+            let ax: f64 = (0..size).map(|j| a[i * size + j] * x[j]).sum();
+            assert!((ax - b[i]).abs() < 1e-9 * (1.0 + b[i].abs()),
+                "row {}: A·x = {} but b = {}", i, ax, b[i]);
+        }
     }
 }

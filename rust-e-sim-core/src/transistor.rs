@@ -48,10 +48,12 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
 ///      `vt*log(1 + Δv/vt)` so exponential grows sub-linearly.
 ///   2. `vold ≤ 0` jumping to `vnew > vcrit` → replace with `vt*log(vnew/vt)`,
 ///      pulling large positive guesses into tractable range.
+///
 /// No limiting in the reverse direction — `exp(v/vt)` saturates harmlessly
-/// for large negative v.
-fn limit_v(vnew: f64, vold: f64, vt: f64, is: f64) -> f64 {
-    let vcrit = vt * (vt / (std::f64::consts::SQRT_2 * is)).ln();
+/// for large negative v.  `vcrit` is `vt·ln(vt / (√2·Is))`, precomputed
+/// per device by [`TransistorModel`].
+#[inline]
+fn limit_v(vnew: f64, vold: f64, vt: f64, vcrit: f64) -> f64 {
     if vnew > vcrit && (vnew - vold).abs() > 2.0 * vt {
         if vold > 0.0 {
             let arg = 1.0 + (vnew - vold) / vt;
@@ -60,6 +62,214 @@ fn limit_v(vnew: f64, vold: f64, vt: f64, is: f64) -> f64 {
         return vt * (vnew / vt).ln();
     }
     vnew
+}
+
+/// A [`Transistor`] with TS defaults applied and every parameter-only
+/// quantity (thermal voltages, `vcrit`, junction ceilings — four `ln`
+/// calls) precomputed.  Build once per device at compile time; `stamp` is
+/// then pure per-iterate work.  Produces bit-identical results to
+/// [`compute_transistor_stamp`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransistorModel {
+    is_pnp: bool,
+    is_sat: f64,
+    bf: f64,
+    br: f64,
+    vaf: f64,
+    var_: f64,
+    ise: f64,
+    isc: f64,
+    ikf: f64,
+    ikr: f64,
+    vt_f: f64,
+    vt_r: f64,
+    vt_e: f64,
+    vt_c: f64,
+    vcrit_f: f64,
+    vcrit_r: f64,
+    vbe_max: f64,
+    vbc_max: f64,
+    /// B-E zero-bias junction capacitance (F).
+    pub cje_farads: f64,
+    /// B-C zero-bias junction capacitance (F).
+    pub cjc_farads: f64,
+    /// Forward transit time (s), default 0.
+    pub tf_seconds: f64,
+    /// Reverse transit time (s), default 0.
+    pub tr_seconds: f64,
+}
+
+impl TransistorModel {
+    pub fn new(q: &Transistor) -> Self {
+        // Model parameters with TS defaults applied.
+        let is_sat = q.is.max(1e-20);
+        let bf = q.beta.max(2.0);
+        let br = q.br.unwrap_or(1.0).max(0.1);
+        let nf = clamp(q.nf, 0.5, 2.5);
+        let nr = clamp(q.nr.unwrap_or(1.0), 0.5, 2.5);
+        let ne = clamp(q.ne.unwrap_or(1.5), 1.0, 4.0);
+        let nc = clamp(q.nc.unwrap_or(2.0), 1.0, 4.0);
+
+        let vt = VT_300K;
+        let vt_f = nf * vt;
+        let vt_r = nr * vt;
+        let vcrit = |vt: f64| vt * (vt / (std::f64::consts::SQRT_2 * is_sat)).ln();
+
+        // Hard ceiling — caps junction current at ~1 A regardless of Is.
+        // The expression `vt*log(1/Is)` is the voltage at which Ic ≈ 1 A.
+        // Bounded by [10, 30] · Vt so Ge (Is ≈ 10 µA) gets ~0.3 V and Si
+        // (Is ≈ 1 pA) gets ~0.72 V.
+        let v_max = |vt: f64| (10.0 * vt).max((30.0 * vt).min(vt * (1.0 / is_sat).ln()));
+
+        Self {
+            is_pnp: q.polarity == Polarity::Pnp,
+            is_sat,
+            bf,
+            br,
+            vaf: q.vaf.max(1.0),
+            var_: q.var_.unwrap_or(100.0).max(1.0),
+            ise: q.ise.unwrap_or(is_sat / bf).max(1e-20),
+            isc: q.isc.unwrap_or(is_sat / br).max(1e-20),
+            ikf: q.ikf.unwrap_or(1e9).max(1e-9),
+            ikr: q.ikr.unwrap_or(1e9).max(1e-9),
+            vt_f,
+            vt_r,
+            vt_e: ne * vt,
+            vt_c: nc * vt,
+            vcrit_f: vcrit(vt_f),
+            vcrit_r: vcrit(vt_r),
+            vbe_max: v_max(vt_f),
+            vbc_max: v_max(vt_r),
+            cje_farads: q.cje_farads,
+            cjc_farads: q.cjc_farads,
+            tf_seconds: q.tf_seconds.unwrap_or(0.0),
+            tr_seconds: q.tr_seconds.unwrap_or(0.0),
+        }
+    }
+
+    /// Compute the BJT stamp for the current Newton iterate.  Arguments as
+    /// for [`compute_transistor_stamp`].
+    pub fn stamp(
+        &self,
+        volts: &[f64],
+        bi: i32,
+        ci: i32,
+        ei: i32,
+        prev_volts: Option<&[f64]>,
+    ) -> TransistorStamp {
+        let &Self {
+            is_pnp, is_sat, bf, br, vaf, var_, ise, isc, ikf, ikr,
+            vt_f, vt_r, vt_e, vt_c, ..
+        } = self;
+
+        let vb = if bi >= 0 { volts[bi as usize] } else { 0.0 };
+        let vc = if ci >= 0 { volts[ci as usize] } else { 0.0 };
+        let ve = if ei >= 0 { volts[ei as usize] } else { 0.0 };
+
+        // Device-frame voltages: positive = forward biased.
+        let vbe_dev = if is_pnp { ve - vb } else { vb - ve };
+        let vbc_dev = if is_pnp { vc - vb } else { vb - vc };
+
+        // ── Junction voltage limiting ────────────────────────────────────
+        let mut vbe = vbe_dev;
+        let mut vbc = vbc_dev;
+        if let Some(prev) = prev_volts {
+            let pb = if bi >= 0 { prev[bi as usize] } else { 0.0 };
+            let pe = if ei >= 0 { prev[ei as usize] } else { 0.0 };
+            let pc = if ci >= 0 { prev[ci as usize] } else { 0.0 };
+            let prev_vbe = if is_pnp { pe - pb } else { pb - pe };
+            let prev_vbc = if is_pnp { pc - pb } else { pb - pc };
+            vbe = limit_v(vbe_dev, prev_vbe, vt_f, self.vcrit_f);
+            vbc = limit_v(vbc_dev, prev_vbc, vt_r, self.vcrit_r);
+        }
+        vbe = vbe.min(self.vbe_max);
+        vbc = vbc.min(self.vbc_max);
+
+        // ── Exponentials ────────────────────────────────────────────────
+        let exp_be   = clamp(vbe / vt_f, -40.0, 40.0).exp();
+        let exp_bc   = clamp(vbc / vt_r, -40.0, 40.0).exp();
+        let exp_be_e = clamp(vbe / vt_e, -40.0, 40.0).exp();
+        let exp_bc_c = clamp(vbc / vt_c, -40.0, 40.0).exp();
+
+        // ── Gummel-Poon base charge Qb ──────────────────────────────────
+        let q1_arg = 1.0 - vbc / vaf - vbe / var_;
+        let q1 = if q1_arg > 0.01 { 1.0 / q1_arg } else { 100.0 };
+
+        let q2_f = is_sat * (exp_be - 1.0) / ikf;
+        let q2_r = is_sat * (exp_bc - 1.0) / ikr;
+        let q2 = q2_f + q2_r;
+
+        let sq = (1.0_f64 + 4.0 * q2).max(0.0).sqrt();
+        let qb = (q1 / 2.0) * (1.0 + sq);
+
+        // ── Transfer current ────────────────────────────────────────────
+        let icc = is_sat * (exp_be - exp_bc) / qb;
+
+        // ── Base-current components ─────────────────────────────────────
+        let ibe_ideal = (is_sat / bf) * (exp_be - 1.0);
+        let ibe_nl = ise * (exp_be_e - 1.0);
+        let ibc_ideal = (is_sat / br) * (exp_bc - 1.0);
+        let ibc_nl = isc * (exp_bc_c - 1.0);
+
+        // ── Terminal currents ───────────────────────────────────────────
+        let ic_term = icc - ibc_ideal - ibc_nl;
+        let ib_term = ibe_ideal + ibe_nl + ibc_ideal + ibc_nl;
+
+        // ── Analytical Jacobian ─────────────────────────────────────────
+        let dq1_dvbe  = q1 * q1 / var_;
+        let dq1_dvbc  = q1 * q1 / vaf;
+        let dq2f_dvbe = is_sat * exp_be / (ikf * vt_f);
+        let dq2r_dvbc = is_sat * exp_bc / (ikr * vt_r);
+
+        let d_qb_dvbe = (qb / q1) * dq1_dvbe + (q1 / sq) * dq2f_dvbe;
+        let d_qb_dvbc = (qb / q1) * dq1_dvbc + (q1 / sq) * dq2r_dvbc;
+
+        let d_icc_dvbe = is_sat * exp_be / (vt_f * qb) - icc * d_qb_dvbe / qb;
+        let d_icc_dvbc = -is_sat * exp_bc / (vt_r * qb) - icc * d_qb_dvbc / qb;
+
+        let d_ibc_dvbc = (is_sat / br) * exp_bc / vt_r + isc * exp_bc_c / vt_c;
+        let d_ibe_dvbe = (is_sat / bf) * exp_be / vt_f + ise * exp_be_e / vt_e;
+
+        // ── MNA conductances ────────────────────────────────────────────
+        let gm_raw    = d_icc_dvbe;
+        let gmu_raw   = d_icc_dvbc - d_ibc_dvbc;
+        let gpi_raw   = d_ibe_dvbe;
+        let gmu_b_raw = d_ibc_dvbc;
+
+        // Clamp to physical range — GMAX = 0.1 S keeps gm below 1/10 Ω.  See
+        // the comment in transistor.ts for why higher values cause Newton to
+        // oscillate on this kit's 100 Ω – 100 kΩ resistor range.
+        const GMAX: f64 = 0.1;
+        let gm    = clamp(gm_raw,     1e-12, GMAX);
+        let gmu   = clamp(gmu_raw,   -GMAX, GMAX);
+        let g_be  = clamp(gpi_raw,    1e-12, GMAX); // = gpi
+        let g_bc  = clamp(gmu_b_raw,  1e-12, GMAX); // = gmu_b (used as B-C shunt)
+        let gmu_b = clamp(gmu_b_raw,  1e-12, GMAX);
+
+        // ── Companion currents ──────────────────────────────────────────
+        // DC path: companions are zero.  Transient: build from CLAMPED Vbe/Vbc
+        // converted back to node-voltage frame (intentionally pulls Newton
+        // toward the clamped operating point).
+        if prev_volts.is_none() {
+            return TransistorStamp {
+                g_be, g_bc, gm, gmu, gpi: g_be, gmu_b,
+                i_eq_b: 0.0, i_eq_c: 0.0, i_eq_e: 0.0,
+            };
+        }
+
+        let s_pol = if is_pnp { -1.0 } else { 1.0 };
+        let vbe_node = if is_pnp { -vbe } else { vbe }; // Vb - Ve
+        let vbc_node = if is_pnp { -vbc } else { vbc }; // Vb - Vc
+
+        let i_eq_c = s_pol * ic_term - gm * vbe_node - gmu * vbc_node;
+        let i_eq_b = s_pol * ib_term - g_be * vbe_node - g_bc * vbc_node;
+        let i_eq_e = -(i_eq_c + i_eq_b);
+
+        TransistorStamp {
+            g_be, g_bc, gm, gmu, gpi: g_be, gmu_b,
+            i_eq_b, i_eq_c, i_eq_e,
+        }
+    }
 }
 
 /// Compute the BJT stamp for the current Newton iterate.
@@ -74,6 +284,9 @@ fn limit_v(vnew: f64, vold: f64, vt: f64, is: f64) -> f64 {
 ///
 /// When `prev_volts` is `None` the companion currents in the output are zero;
 /// this is the DC operating-point path.
+///
+/// Convenience wrapper that rebuilds the [`TransistorModel`] on every call;
+/// hot loops should build the model once and call [`TransistorModel::stamp`].
 pub fn compute_transistor_stamp(
     q: &Transistor,
     volts: &[f64],
@@ -82,142 +295,7 @@ pub fn compute_transistor_stamp(
     ei: i32,
     prev_volts: Option<&[f64]>,
 ) -> TransistorStamp {
-    let vb = if bi >= 0 { volts[bi as usize] } else { 0.0 };
-    let vc = if ci >= 0 { volts[ci as usize] } else { 0.0 };
-    let ve = if ei >= 0 { volts[ei as usize] } else { 0.0 };
-
-    let is_pnp = q.polarity == Polarity::Pnp;
-
-    // Device-frame voltages: positive = forward biased.
-    let vbe_dev = if is_pnp { ve - vb } else { vb - ve };
-    let vbc_dev = if is_pnp { vc - vb } else { vb - vc };
-
-    // Model parameters with TS defaults applied.
-    let is_sat = q.is.max(1e-20);
-    let bf = q.beta.max(2.0);
-    let br = q.br.unwrap_or(1.0).max(0.1);
-    let vaf = q.vaf.max(1.0);
-    let var_ = q.var_.unwrap_or(100.0).max(1.0);
-    let nf = clamp(q.nf, 0.5, 2.5);
-    let nr = clamp(q.nr.unwrap_or(1.0), 0.5, 2.5);
-    let ne = clamp(q.ne.unwrap_or(1.5), 1.0, 4.0);
-    let nc = clamp(q.nc.unwrap_or(2.0), 1.0, 4.0);
-    let ise = q.ise.unwrap_or(is_sat / bf).max(1e-20);
-    let isc = q.isc.unwrap_or(is_sat / br).max(1e-20);
-    let ikf = q.ikf.unwrap_or(1e9).max(1e-9);
-    let ikr = q.ikr.unwrap_or(1e9).max(1e-9);
-
-    let vt = VT_300K;
-    let vt_f = nf * vt;
-    let vt_r = nr * vt;
-    let vt_e = ne * vt;
-    let vt_c = nc * vt;
-
-    // ── Junction voltage limiting ────────────────────────────────────────
-    let mut vbe = vbe_dev;
-    let mut vbc = vbc_dev;
-    if let Some(prev) = prev_volts {
-        let pb = if bi >= 0 { prev[bi as usize] } else { 0.0 };
-        let pe = if ei >= 0 { prev[ei as usize] } else { 0.0 };
-        let pc = if ci >= 0 { prev[ci as usize] } else { 0.0 };
-        let prev_vbe = if is_pnp { pe - pb } else { pb - pe };
-        let prev_vbc = if is_pnp { pc - pb } else { pb - pc };
-        vbe = limit_v(vbe_dev, prev_vbe, vt_f, is_sat);
-        vbc = limit_v(vbc_dev, prev_vbc, vt_r, is_sat);
-    }
-    // Hard ceiling — caps junction current at ~1 A regardless of Is.
-    // The expression `vt*log(1/Is)` is the voltage at which Ic ≈ 1 A.
-    // Bounded by [10, 30] · Vt so Ge (Is ≈ 10 µA) gets ~0.3 V and Si
-    // (Is ≈ 1 pA) gets ~0.72 V.
-    let vbe_max = (10.0 * vt_f).max((30.0 * vt_f).min(vt_f * (1.0 / is_sat).ln()));
-    let vbc_max = (10.0 * vt_r).max((30.0 * vt_r).min(vt_r * (1.0 / is_sat).ln()));
-    vbe = vbe.min(vbe_max);
-    vbc = vbc.min(vbc_max);
-
-    // ── Exponentials ────────────────────────────────────────────────────
-    let exp_be   = clamp(vbe / vt_f, -40.0, 40.0).exp();
-    let exp_bc   = clamp(vbc / vt_r, -40.0, 40.0).exp();
-    let exp_be_e = clamp(vbe / vt_e, -40.0, 40.0).exp();
-    let exp_bc_c = clamp(vbc / vt_c, -40.0, 40.0).exp();
-
-    // ── Gummel-Poon base charge Qb ──────────────────────────────────────
-    let q1_arg = 1.0 - vbc / vaf - vbe / var_;
-    let q1 = if q1_arg > 0.01 { 1.0 / q1_arg } else { 100.0 };
-
-    let q2_f = is_sat * (exp_be - 1.0) / ikf;
-    let q2_r = is_sat * (exp_bc - 1.0) / ikr;
-    let q2 = q2_f + q2_r;
-
-    let sq = (1.0_f64 + 4.0 * q2).max(0.0).sqrt();
-    let qb = (q1 / 2.0) * (1.0 + sq);
-
-    // ── Transfer current ────────────────────────────────────────────────
-    let icc = is_sat * (exp_be - exp_bc) / qb;
-
-    // ── Base-current components ─────────────────────────────────────────
-    let ibe_ideal = (is_sat / bf) * (exp_be - 1.0);
-    let ibe_nl = ise * (exp_be_e - 1.0);
-    let ibc_ideal = (is_sat / br) * (exp_bc - 1.0);
-    let ibc_nl = isc * (exp_bc_c - 1.0);
-
-    // ── Terminal currents ───────────────────────────────────────────────
-    let ic_term = icc - ibc_ideal - ibc_nl;
-    let ib_term = ibe_ideal + ibe_nl + ibc_ideal + ibc_nl;
-
-    // ── Analytical Jacobian ─────────────────────────────────────────────
-    let dq1_dvbe  = q1 * q1 / var_;
-    let dq1_dvbc  = q1 * q1 / vaf;
-    let dq2f_dvbe = is_sat * exp_be / (ikf * vt_f);
-    let dq2r_dvbc = is_sat * exp_bc / (ikr * vt_r);
-
-    let d_qb_dvbe = (qb / q1) * dq1_dvbe + (q1 / sq) * dq2f_dvbe;
-    let d_qb_dvbc = (qb / q1) * dq1_dvbc + (q1 / sq) * dq2r_dvbc;
-
-    let d_icc_dvbe = is_sat * exp_be / (vt_f * qb) - icc * d_qb_dvbe / qb;
-    let d_icc_dvbc = -is_sat * exp_bc / (vt_r * qb) - icc * d_qb_dvbc / qb;
-
-    let d_ibc_dvbc = (is_sat / br) * exp_bc / vt_r + isc * exp_bc_c / vt_c;
-    let d_ibe_dvbe = (is_sat / bf) * exp_be / vt_f + ise * exp_be_e / vt_e;
-
-    // ── MNA conductances ────────────────────────────────────────────────
-    let gm_raw    = d_icc_dvbe;
-    let gmu_raw   = d_icc_dvbc - d_ibc_dvbc;
-    let gpi_raw   = d_ibe_dvbe;
-    let gmu_b_raw = d_ibc_dvbc;
-
-    // Clamp to physical range — GMAX = 0.1 S keeps gm below 1/10 Ω.  See
-    // the comment in transistor.ts for why higher values cause Newton to
-    // oscillate on this kit's 100 Ω – 100 kΩ resistor range.
-    const GMAX: f64 = 0.1;
-    let gm    = clamp(gm_raw,     1e-12, GMAX);
-    let gmu   = clamp(gmu_raw,   -GMAX, GMAX);
-    let g_be  = clamp(gpi_raw,    1e-12, GMAX); // = gpi
-    let g_bc  = clamp(gmu_b_raw,  1e-12, GMAX); // = gmu_b (used as B-C shunt)
-    let gmu_b = clamp(gmu_b_raw,  1e-12, GMAX);
-
-    // ── Companion currents ──────────────────────────────────────────────
-    // DC path: companions are zero.  Transient: build from CLAMPED Vbe/Vbc
-    // converted back to node-voltage frame (intentionally pulls Newton
-    // toward the clamped operating point).
-    if prev_volts.is_none() {
-        return TransistorStamp {
-            g_be, g_bc, gm, gmu, gpi: g_be, gmu_b,
-            i_eq_b: 0.0, i_eq_c: 0.0, i_eq_e: 0.0,
-        };
-    }
-
-    let s_pol = if is_pnp { -1.0 } else { 1.0 };
-    let vbe_node = if is_pnp { -vbe } else { vbe }; // Vb - Ve
-    let vbc_node = if is_pnp { -vbc } else { vbc }; // Vb - Vc
-
-    let i_eq_c = s_pol * ic_term - gm * vbe_node - gmu * vbc_node;
-    let i_eq_b = s_pol * ib_term - g_be * vbe_node - g_bc * vbc_node;
-    let i_eq_e = -(i_eq_c + i_eq_b);
-
-    TransistorStamp {
-        g_be, g_bc, gm, gmu, gpi: g_be, gmu_b,
-        i_eq_b, i_eq_c, i_eq_e,
-    }
+    TransistorModel::new(q).stamp(volts, bi, ci, ei, prev_volts)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────

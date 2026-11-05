@@ -27,15 +27,17 @@ const PIVOT_THRESHOLD: f64 = 1e-14;
 ///
 /// `l_cols[k]` is the set of row indices `i > k` for which `L[i,k]` is
 /// structurally non-zero.  `u_rows[k]` is the set of column indices
-/// `j > k` for which `U[k,j]` is structurally non-zero.  `rank_one_updates[k]`
-/// is the flat list of `(i,j)` pairs where `A[i,j] -= L[i,k]*U[k,j]` is
-/// performed — stored as `[i0,j0,i1,j1,…]` for sequential access.
+/// `j > k` for which `U[k,j]` is structurally non-zero.
+///
+/// The rank-1 update at pivot `k` touches exactly `l_cols[k] × u_rows[k]`:
+/// symbolic elimination marks `(i,j)` as fill whenever `L[i,k]` and
+/// `U[k,j]` are both structurally non-zero, so no separate update list is
+/// needed.
 #[derive(Debug, Clone)]
 pub struct SparseLuPattern {
     pub n: usize,
     pub l_cols: Vec<Box<[i32]>>,
     pub u_rows: Vec<Box<[i32]>>,
-    pub rank_one_updates: Vec<Box<[i32]>>,
 }
 
 /// Build a `SparseLuPattern` from a boolean occupancy marker.
@@ -67,42 +69,23 @@ pub fn analyze_pattern(marker: &[u8], n: usize) -> SparseLuPattern {
     // Build per-pivot access lists.
     let mut l_cols: Vec<Box<[i32]>> = Vec::with_capacity(n);
     let mut u_rows: Vec<Box<[i32]>> = Vec::with_capacity(n);
-    let mut rank_one_updates: Vec<Box<[i32]>> = Vec::with_capacity(n);
 
     for k in 0..n {
         // L column k — rows strictly below the diagonal in the fill pattern.
-        let mut l_rows_k: Vec<i32> = Vec::new();
-        for i in (k + 1)..n {
-            if fill[i * n + k] != 0 {
-                l_rows_k.push(i as i32);
-            }
-        }
-
+        let l_rows_k: Vec<i32> = ((k + 1)..n)
+            .filter(|&i| fill[i * n + k] != 0)
+            .map(|i| i as i32)
+            .collect();
         // U row k — columns strictly to the right of the diagonal.
-        let mut u_cols_k: Vec<i32> = Vec::new();
-        for j in (k + 1)..n {
-            if fill[k * n + j] != 0 {
-                u_cols_k.push(j as i32);
-            }
-        }
-
-        // Rank-1 update pairs: A[i,j] -= L[i,k]*U[k,j] for fill positions.
-        let mut updates_k: Vec<i32> = Vec::new();
-        for &i in &l_rows_k {
-            for &j in &u_cols_k {
-                if fill[(i as usize) * n + (j as usize)] != 0 {
-                    updates_k.push(i);
-                    updates_k.push(j);
-                }
-            }
-        }
-
+        let u_cols_k: Vec<i32> = ((k + 1)..n)
+            .filter(|&j| fill[k * n + j] != 0)
+            .map(|j| j as i32)
+            .collect();
         l_cols.push(l_rows_k.into_boxed_slice());
         u_rows.push(u_cols_k.into_boxed_slice());
-        rank_one_updates.push(updates_k.into_boxed_slice());
     }
 
-    SparseLuPattern { n, l_cols, u_rows, rank_one_updates }
+    SparseLuPattern { n, l_cols, u_rows }
 }
 
 /// Numeric LU factorization in place using a precomputed symbolic pattern.
@@ -119,29 +102,30 @@ pub fn numeric_factor(mat: &mut [f64], n: usize, pat: &SparseLuPattern) -> bool 
     debug_assert_eq!(pat.n, n);
 
     for k in 0..n {
-        let ukk = mat[k * n + k];
+        let k_row = k * n;
+        let ukk = mat[k_row + k];
         if ukk.abs() < PIVOT_THRESHOLD {
             return false;
         }
         let inv = 1.0 / ukk;
+        let u_cols = &pat.u_rows[k];
 
-        // Scale the L column: L[i,k] = A[i,k] / U[k,k]
+        // Rows i > k live strictly after row k, so split once to borrow
+        // U's row k immutably while updating row i.
+        let (upper, lower) = mat.split_at_mut(k_row + n);
+        let u_row_k = &upper[k_row..];
+        let lower_base = k_row + n;
+
         for &i in pat.l_cols[k].iter() {
-            mat[(i as usize) * n + k] *= inv;
-        }
-
-        // Rank-1 update: A[i,j] -= L[i,k] * U[k,j] for every recorded pair.
-        let upd = &pat.rank_one_updates[k];
-        let k_row = k * n;
-        let mut p = 0;
-        while p < upd.len() {
-            let i = upd[p] as usize;
-            let j = upd[p + 1] as usize;
-            // mat[i,j] -= mat[i,k] * mat[k,j]
-            let lik = mat[i * n + k];
-            let ukj = mat[k_row + j];
-            mat[i * n + j] -= lik * ukj;
-            p += 2;
+            let row_i = &mut lower[(i as usize) * n - lower_base..][..n];
+            // L[i,k] = A[i,k] / U[k,k]
+            let lik = row_i[k] * inv;
+            row_i[k] = lik;
+            // Rank-1 update: A[i,j] -= L[i,k] * U[k,j]
+            for &j in u_cols.iter() {
+                let j = j as usize;
+                row_i[j] -= lik * u_row_k[j];
+            }
         }
     }
     true
@@ -251,11 +235,10 @@ where
         for &i in &neighbours {
             adj[i].remove(&best);
         }
-        for a in 0..neighbours.len() {
-            let i = neighbours[a];
-            for b in 0..neighbours.len() {
+        for (a, &i) in neighbours.iter().enumerate() {
+            for (b, &j) in neighbours.iter().enumerate() {
                 if a != b {
-                    adj[i].insert(neighbours[b]);
+                    adj[i].insert(j);
                 }
             }
         }
@@ -324,8 +307,8 @@ mod tests {
         let mut marker = vec![0u8; n * n];
         for i in 0..n {
             marker[i * n + i] = 1;       // diagonal
-            marker[0 * n + i] = 1;       // first row
-            marker[i * n + 0] = 1;       // first column
+            marker[i] = 1;               // first row
+            marker[i * n] = 1;           // first column
         }
         let pat = analyze_pattern(&marker, n);
 
@@ -333,8 +316,8 @@ mod tests {
         let mut mat = vec![0.0; n * n];
         for i in 0..n { mat[i * n + i] = 5.0 + i as f64; }
         for i in 1..n {
-            mat[0 * n + i] = 1.0;
-            mat[i * n + 0] = 1.0;
+            mat[i] = 1.0;       // first row
+            mat[i * n] = 1.0;   // first column
         }
         // Reference solution: pick x = [1,2,3,4,5], compute b = A·x.
         let x_ref = [1.0, 2.0, 3.0, 4.0, 5.0];

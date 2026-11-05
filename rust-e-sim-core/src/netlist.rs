@@ -86,12 +86,12 @@ pub enum Element {
     /// node IDs.
     ///
     /// - Coil:       a resistor between `coil_positive` and `coil_negative`
-    ///               with value `coil_resistance_ohms`.
+    ///   with value `coil_resistance_ohms`.
     /// - Contact:    `common` always connects to the active throw via a
-    ///               low resistance (`ron_ohms`) and to the inactive throw
-    ///               via a high resistance (`roff_ohms`).  When the relay
-    ///               is inactive (de-energised) the NC throw is active.
-    ///               When active (energised) the NO throw is active.
+    ///   low resistance (`ron_ohms`) and to the inactive throw via a high
+    ///   resistance (`roff_ohms`).  When the relay is inactive
+    ///   (de-energised) the NC throw is active.  When active (energised)
+    ///   the NO throw is active.
     ///
     /// State transitions use coil-current thresholds with hysteresis:
     /// transitions to active when |I_coil| > `on_current`, back to inactive

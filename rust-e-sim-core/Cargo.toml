@@ -2,11 +2,12 @@
 name = "rust-e-sim-core"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Pure-Rust circuit simulation kernels"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 [dev-dependencies]
 # Floating-point comparison helpers for the test suite.
 approx = "0.5.1"

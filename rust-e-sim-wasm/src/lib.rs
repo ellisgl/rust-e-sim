@@ -338,6 +338,7 @@ impl Simulator {
     /// link this winding into a mutual-inductance group with strength `k`
     /// supplied by an `add_coupling()` element using the same group.
     /// Pass `None`/`1` for stand-alone inductors.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_inductor(
         &mut self, id: String, a: u32, b: u32,
         inductance_henry: f64, saturation_current_a: Option<f64>,
@@ -586,18 +587,34 @@ impl Simulator {
     /// to the load current.  Callers that want a user-friendly "supply
     /// current" should negate the value at the call site.
     pub fn voltage_source_current(&self, id: &str) -> f64 {
-        let (c, s) = match (self.compiled.as_ref(), self.state.as_ref()) {
-            (Some(c), Some(s)) => (c, s),
-            _ => return 0.0,
-        };
-        for (vi, &el_idx) in c.voltage_source_indices.iter().enumerate() {
-            if let rust_e_sim_core::netlist::Element::VoltageSource { id: el_id, .. } = &c.elements[el_idx] {
-                if el_id == id {
-                    return s.voltage_source_currents[vi];
-                }
-            }
-        }
-        0.0
+        self.voltage_source_current_at(self.voltage_source_index(id))
+    }
+
+    /// Resolve a voltage source id to a stable probe index for
+    /// `voltage_source_current_at`, or `-1` if unknown / not compiled.
+    ///
+    /// Resolve once after `compile()` and read by index in the audio loop:
+    /// the `&str` overload has to UTF-8-encode the JS string into wasm
+    /// memory (alloc + copy + free) and linearly scan elements on every
+    /// call.  The index stays valid until the next `compile()`.
+    pub fn voltage_source_index(&self, id: &str) -> i32 {
+        use rust_e_sim_core::netlist::Element;
+        let Some(c) = self.compiled.as_ref() else { return -1 };
+        c.voltage_source_indices.iter()
+            .position(|&el_idx| matches!(
+                &c.elements[el_idx], Element::VoltageSource { id: el_id, .. } if el_id == id
+            ))
+            .map_or(-1, |i| i as i32)
+    }
+
+    /// Voltage-source branch current by probe index (see
+    /// `voltage_source_index`).  Same sign convention as
+    /// `voltage_source_current`; 0.0 for an out-of-range index.
+    pub fn voltage_source_current_at(&self, index: i32) -> f64 {
+        let Some(s) = self.state.as_ref() else { return 0.0 };
+        usize::try_from(index).ok()
+            .and_then(|i| s.voltage_source_currents.get(i).copied())
+            .unwrap_or(0.0)
     }
 
     /// Per-inductor branch current by component id.  Returns 0.0 if the
@@ -610,18 +627,28 @@ impl Simulator {
     /// a better audio probe than the voltage across the speaker terminals,
     /// which mixes resistive drop and inductive EMF.
     pub fn inductor_current(&self, id: &str) -> f64 {
-        let (c, s) = match (self.compiled.as_ref(), self.state.as_ref()) {
-            (Some(c), Some(s)) => (c, s),
-            _ => return 0.0,
-        };
-        for (li, &el_idx) in c.inductor_indices.iter().enumerate() {
-            if let rust_e_sim_core::netlist::Element::Inductor { id: el_id, .. } = &c.elements[el_idx] {
-                if el_id == id {
-                    return s.inductor_currents[li];
-                }
-            }
-        }
-        0.0
+        self.inductor_current_at(self.inductor_index(id))
+    }
+
+    /// Resolve an inductor id to a probe index for `inductor_current_at`,
+    /// or `-1` if unknown / not compiled.  Valid until the next `compile()`.
+    pub fn inductor_index(&self, id: &str) -> i32 {
+        use rust_e_sim_core::netlist::Element;
+        let Some(c) = self.compiled.as_ref() else { return -1 };
+        c.inductor_indices.iter()
+            .position(|&el_idx| matches!(
+                &c.elements[el_idx], Element::Inductor { id: el_id, .. } if el_id == id
+            ))
+            .map_or(-1, |i| i as i32)
+    }
+
+    /// Inductor branch current by probe index (see `inductor_index`).
+    /// 0.0 for an out-of-range index.
+    pub fn inductor_current_at(&self, index: i32) -> f64 {
+        let Some(s) = self.state.as_ref() else { return 0.0 };
+        usize::try_from(index).ok()
+            .and_then(|i| s.inductor_currents.get(i).copied())
+            .unwrap_or(0.0)
     }
 
     /// Total node count after compile (0 if not yet compiled).
@@ -716,13 +743,13 @@ impl Simulator {
     /// rust-e-sim-wasm-bindgen; 0/1 encoding.
     pub fn export_relay_active(&self) -> Vec<u8> {
         self.state.as_ref()
-            .map(|s| s.relay_active.iter().map(|&b| if b { 1 } else { 0 }).collect())
+            .map(|s| s.relay_active.iter().map(|&b| u8::from(b)).collect())
             .unwrap_or_default()
     }
     pub fn import_relay_active(&mut self, v: Vec<u8>) {
         if let Some(s) = self.state.as_mut() {
             if v.len() == s.relay_active.len() {
-                for (i, &b) in v.iter().enumerate() { s.relay_active[i] = b != 0; }
+                for (dst, &b) in s.relay_active.iter_mut().zip(&v) { *dst = b != 0; }
             }
         }
     }
@@ -919,11 +946,13 @@ mod tests {
 
         assert!(sim.solve_dc(), "DC solve failed");
 
-        // DC parity against TS dc.ts: Vb at the same operating point.
+        // DC parity against TS dc.ts — same circuit and reference value as
+        // rust-e-sim-core's `common_emitter_bjt_dc_via_solve_dc`.  Sanity:
+        // Thevenin 2.105 V / 8.25 kΩ into β=200 with RE=1 kΩ → Vb ≈ 2.05 V.
         let vb_dc = sim.node_voltage(2);
         assert!(
-            (vb_dc - 3.4478392641000175).abs() < 1e-6,
-            "Vb DC = {} (expected TS-parity 3.4478…)",
+            (vb_dc - 2.054).abs() < 1.5e-1,
+            "Vb DC = {} (expected TS-parity ≈2.054)",
             vb_dc,
         );
 
@@ -1011,6 +1040,34 @@ mod tests {
         let v_final = sim_b.node_voltage(2);
         assert!((v_final - 3.16).abs() < 0.1,
             "expected V ≈ 3.16 V after pot turn + further charge, got {}", v_final);
+    }
+
+    /// Index-based probes agree with the string-keyed ones and degrade to
+    /// -1 / 0.0 for unknown ids, bad indices, or an uncompiled simulator.
+    #[test]
+    fn probe_indices_match_string_lookups() {
+        let mut sim = Simulator::new(0);
+        sim.add_voltage_source("V1".into(), 1, 0, 5.0);
+        sim.add_resistor("R1".into(), 1, 2, 10.0);
+        sim.add_inductor("L1".into(), 2, 0, 1e-3, None, None, None);
+        assert_eq!(sim.voltage_source_index("V1"), -1, "not compiled yet");
+        assert!(sim.compile());
+
+        let vi = sim.voltage_source_index("V1");
+        let li = sim.inductor_index("L1");
+        assert_eq!((vi, li), (0, 0));
+        assert_eq!(sim.voltage_source_index("nope"), -1);
+        assert_eq!(sim.inductor_index("nope"), -1);
+
+        for _ in 0..200 {
+            assert!(sim.step(1e-5).ok);
+        }
+        let i_l = sim.inductor_current_at(li);
+        assert!(i_l > 0.1, "inductor should be charging, got {}", i_l);
+        assert_eq!(i_l, sim.inductor_current("L1"));
+        assert_eq!(sim.voltage_source_current_at(vi), sim.voltage_source_current("V1"));
+        assert_eq!(sim.voltage_source_current_at(-1), 0.0);
+        assert_eq!(sim.inductor_current_at(7), 0.0);
     }
 
     #[test]

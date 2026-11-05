@@ -19,7 +19,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::diode::DiodeModel;
 use crate::netlist::{Element, Netlist};
+use crate::transistor::TransistorModel;
 use crate::sparse::{analyze_pattern, minimum_degree_order, SparseLuPattern};
 
 /// All the precomputed structure the Newton inner loop needs.  Buffers
@@ -44,12 +46,20 @@ pub struct CompiledNetlist {
     pub rhs: Vec<f64>,        // size
     pub base_matrix: Vec<f64>,// size × size — built once per step
     pub base_rhs: Vec<f64>,   // size
+    /// Newton iterate scratch (length `size`).  Reused across steps so the
+    /// transient hot path never allocates.
+    pub est: Vec<f64>,
 
     // ── Static stamps ───────────────────────────────────────────────────
     /// Flat triples `[row0, col0, val0, row1, col1, val1, …]`.  Applied at
     /// the top of each step before the Newton loop.  Resistor conductances
     /// and voltage-source incidence go here.
     pub static_stamps: Vec<f64>,
+    /// `static_stamps` pre-accumulated into a dense `size × size` matrix
+    /// (same summation order, so bit-identical).  Each step starts its
+    /// base matrix with a single `copy_from_slice` of this instead of
+    /// zero-filling and re-scattering every triple.
+    pub static_matrix: Vec<f64>,
     /// Diagonal indices for gmin regularisation (one per non-ground node).
     pub gmin_indices: Vec<i32>,
 
@@ -77,10 +87,15 @@ pub struct CompiledNetlist {
     /// Per-transistor [base, collector, emitter] compact indices.
     pub transistor_node_indices: Vec<i32>,
     pub transistor_count: usize,
+    /// Per-transistor precomputed model (defaults applied, parameter-only
+    /// logs hoisted), parallel to `transistor_indices`.
+    pub transistor_models: Vec<TransistorModel>,
 
     /// Per-diode [anode, cathode] compact indices.
     pub diode_node_indices: Vec<i32>,
     pub diode_count: usize,
+    /// Per-diode precomputed model, parallel to `diode_indices`.
+    pub diode_models: Vec<DiodeModel>,
 
     /// Per-relay flat [coil+, coil-, common, NC, NO] compact indices.
     /// Cached so the dynamic relay-stamping path doesn't have to re-resolve
@@ -346,18 +361,22 @@ pub fn compile_netlist(netlist: &Netlist) -> Option<CompiledNetlist> {
 
     // ── Transistor + diode index caches ─────────────────────────────────
     let mut transistor_node_indices: Vec<i32> = Vec::with_capacity(transistor_count * 3);
+    let mut transistor_models: Vec<TransistorModel> = Vec::with_capacity(transistor_count);
     for &ti in &transistor_indices {
-        if let Element::Transistor { base, collector, emitter, .. } = &netlist.elements[ti] {
+        if let Element::Transistor { base, collector, emitter, params, .. } = &netlist.elements[ti] {
             transistor_node_indices.push(ni(*base));
             transistor_node_indices.push(ni(*collector));
             transistor_node_indices.push(ni(*emitter));
+            transistor_models.push(TransistorModel::new(params));
         }
     }
     let mut diode_node_indices: Vec<i32> = Vec::with_capacity(diode_count * 2);
+    let mut diode_models: Vec<DiodeModel> = Vec::with_capacity(diode_count);
     for &di in &diode_indices {
-        if let Element::Diode { anode, cathode, .. } = &netlist.elements[di] {
+        if let Element::Diode { anode, cathode, params, .. } = &netlist.elements[di] {
             diode_node_indices.push(ni(*anode));
             diode_node_indices.push(ni(*cathode));
+            diode_models.push(DiodeModel::new(params));
         }
     }
 
@@ -478,6 +497,11 @@ pub fn compile_netlist(netlist: &Netlist) -> Option<CompiledNetlist> {
 
     let sparse_pattern = analyze_pattern(&marker, size);
 
+    let mut static_matrix = vec![0.0; size * size];
+    for t in static_stamps.chunks_exact(3) {
+        static_matrix[(t[0] as usize) * size + (t[1] as usize)] += t[2];
+    }
+
     Some(CompiledNetlist {
         non_ground_nodes,
         node_index,
@@ -488,7 +512,9 @@ pub fn compile_netlist(netlist: &Netlist) -> Option<CompiledNetlist> {
         rhs: vec![0.0; size],
         base_matrix: vec![0.0; size * size],
         base_rhs: vec![0.0; size],
+        est: vec![0.0; size],
         static_stamps,
+        static_matrix,
         gmin_indices,
         cap_stamp_indices,
         cap_count,
@@ -498,8 +524,10 @@ pub fn compile_netlist(netlist: &Netlist) -> Option<CompiledNetlist> {
         inductor_coupling_pairs,
         transistor_node_indices,
         transistor_count,
+        transistor_models,
         diode_node_indices,
         diode_count,
+        diode_models,
         relay_node_indices,
         relay_count,
         voltage_source_branch_rows,

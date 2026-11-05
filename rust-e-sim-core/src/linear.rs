@@ -7,14 +7,13 @@
 //! Note: This is a safety-net solver. Performance is prioritized for the
 //! `sparse` module, while this module focuses on correctness and robustness.
 
-/// Solve `A x = b` for `x`, returning `Some(x)` on success or `None` if
-/// the matrix is numerically singular (pivot below threshold even after
-/// partial pivoting).
+/// Solve `A x = b` in place.  Returns `true` on success, with `x` written
+/// into `rhs`, or `false` if the matrix is numerically singular (pivot
+/// below threshold even after partial pivoting).
 ///
 /// `mat` is `n*n` row-major and is consumed (mutated in place).  `rhs` is
-/// length `n` and is also consumed.  Result is a freshly-allocated `Vec`
-/// of length `n`.
-pub fn solve_linear_system(mat: &mut [f64], rhs: &mut [f64], n: usize) -> Option<Vec<f64>> {
+/// length `n`; on failure its contents are unspecified.  No allocation.
+pub fn solve_linear_system(mat: &mut [f64], rhs: &mut [f64], n: usize) -> bool {
     debug_assert_eq!(mat.len(), n * n);
     debug_assert_eq!(rhs.len(), n);
 
@@ -32,7 +31,7 @@ pub fn solve_linear_system(mat: &mut [f64], rhs: &mut [f64], n: usize) -> Option
             }
         }
         if max_abs < PIVOT_THRESHOLD {
-            return None;
+            return false;
         }
         if piv != k {
             for j in 0..n {
@@ -51,16 +50,16 @@ pub fn solve_linear_system(mat: &mut [f64], rhs: &mut [f64], n: usize) -> Option
         }
     }
 
-    // Back substitution.
-    let mut x = vec![0.0; n];
+    // Back substitution, in place: entries `rhs[k+1..]` already hold x.
     for k in (0..n).rev() {
+        let row = &mat[k * n..(k + 1) * n];
         let mut s = rhs[k];
         for j in (k + 1)..n {
-            s -= mat[k * n + j] * x[j];
+            s -= row[j] * rhs[j];
         }
-        x[k] = s / mat[k * n + k];
+        rhs[k] = s / row[k];
     }
-    Some(x)
+    true
 }
 
 #[cfg(test)]
@@ -75,7 +74,8 @@ mod tests {
                            1.0, 3.0, 1.0,
                            0.0, 1.0, 2.0];
         let mut rhs = vec![5.0, 6.0, 4.0];
-        let x = solve_linear_system(&mut mat, &mut rhs, 3).unwrap();
+        assert!(solve_linear_system(&mut mat, &mut rhs, 3));
+        let x = rhs;
         assert_relative_eq!(x[0], 17.0 / 18.0, epsilon = 1e-12);
         assert_relative_eq!(x[1], 11.0 / 9.0,  epsilon = 1e-12);
         assert_relative_eq!(x[2], 25.0 / 18.0, epsilon = 1e-12);
@@ -86,7 +86,7 @@ mod tests {
         let mut mat = vec![0.0, 1.0,
                            0.0, 1.0];
         let mut rhs = vec![1.0, 1.0];
-        assert!(solve_linear_system(&mut mat, &mut rhs, 2).is_none());
+        assert!(!solve_linear_system(&mut mat, &mut rhs, 2));
     }
 
     #[test]
@@ -102,7 +102,8 @@ mod tests {
         // Row 2: 1*x + 0*y + 1*z = 2
         // From rows 1,2: x = 2 - y, x = 2 - z → y = z.
         // Row 0: y + z = 3 → 2y = 3 → y = z = 1.5; x = 0.5.
-        let x = solve_linear_system(&mut mat, &mut rhs, 3).unwrap();
+        assert!(solve_linear_system(&mut mat, &mut rhs, 3));
+        let x = rhs;
         assert_relative_eq!(x[0], 0.5, epsilon = 1e-12);
         assert_relative_eq!(x[1], 1.5, epsilon = 1e-12);
         assert_relative_eq!(x[2], 1.5, epsilon = 1e-12);
